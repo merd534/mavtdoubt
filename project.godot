@@ -12,7 +12,7 @@ config_version=5
 
 config/name="Neon Noir: Shadows of Rain"
 config/description="Процедурный нуарно-неоновый детектив. Город и преступления генерируются на лету."
-run/main_scene="res://scenes/dev/Phase3DetailBench.tscn"
+run/main_scene="res://scenes/ui/MainMenu.tscn"
 config/use_custom_user_dir=true
 config/custom_user_dir_name="NeonNoirShadowsOfRain"
 config/features=PackedStringArray("4.6", "Forward Plus")
