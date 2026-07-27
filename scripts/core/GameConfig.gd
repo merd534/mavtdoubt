@@ -47,6 +47,7 @@ const DEFAULTS: Dictionary = {
 	"graphics": {
 		"preset": "Высокие",
 		"fsr_mode": 3,                  # 0 Performance .. 3 Native
+		"fsr_sharpness": 0.25,          # 0 = максимально резко, 2 = мыло
 		"resolution_scale": 1.0,
 		"vsync": 0,
 		"fps_limit": 0,
@@ -62,11 +63,26 @@ const DEFAULTS: Dictionary = {
 		"npc_budget": 220,
 		"anisotropy": 2,
 		"msaa": 0,
+		"taa": false,
+		"debanding": true,
+		"texture_quality": 2,           # 0 низкое .. 3 максимальное
+		# --- ФАЗА 3-4: плотность детализации и стриминг ---
+		"detail_density": 0.8,          # 0 = только коробки зданий
+		"cables": true,
+		"steam": true,
+		"debris": true,
+		"interior_furniture": true,
+		"billboard_lights": 2,          # живых источников от вывесок на здание
+		"hide_radius_chunks": 1,        # буферное кольцо скрытых чанков
 	},
 	"gameplay": {
+		"difficulty_preset": "Детектив",
 		"clue_highlight": true,
 		"police_reaction": 1.0,         # множитель скорости реакции
+		"hack_alarm_speed": 1.0,        # скорость реакции полиции на взлом
 		"case_time_limit_h": 72.0,      # 0 = без лимита
+		"killer_moves_after_h": 0.0,    # 0 = убийца не совершает нового преступления
+		"clue_scan_recharge": 1.0,      # перезарядка сканера улик, сек
 		"permadeath": false,
 		"autosave": true,
 		"witness_reliability": 1.0,
