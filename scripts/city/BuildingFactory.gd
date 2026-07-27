@@ -12,6 +12,10 @@ extends RefCounted
 ## Бесшовность: сетка кварталов привязана не к чанку, а к границам района.
 ## Квартал обрабатывается тем чанком, в который попал его **центр**, поэтому
 ## на стыках чанков не бывает ни разрывов, ни задвоенных зданий.
+##
+## Заполнение пустырей: районы атласа — прямоугольники и не стыкуются встык,
+## поэтому непокрытые зоны добирает NoirDistrictInfill — иначе посреди
+## карты остаются пустые поля.
 
 const ARTERIAL_EVERY := 4        ## каждая N-я линия сетки — магистраль
 const ALLEY_WIDTH := 2.2
@@ -20,6 +24,8 @@ const MIN_LOT := 5.0
 const OCCLUDER_MIN_HEIGHT := 18.0
 const LAMP_SPACING := 26.0
 const FLOOR_HEIGHT := 3.4
+const PODIUM_MIN_HEIGHT := 26.0   ## от какого дома имеет смысл стилобат
+const PODIUM_CHANCE := 0.62
 
 ## Габариты landmark'ов по типу локации (метры).
 const LANDMARK_FOOTPRINT: Dictionary = {
@@ -68,8 +74,6 @@ static func generate(chunk_rect: Rect2, city_seed: int, detail_level: int) -> Di
 	}
 
 	var districts: Array[String] = _districts_touching(chunk_rect)
-	if districts.is_empty():
-		return result
 
 	# Landmark'и ставим первыми: обычная застройка обязана их обойти.
 	var reserved: Array[Rect2] = []
@@ -82,8 +86,29 @@ static func generate(chunk_rect: Rect2, city_seed: int, detail_level: int) -> Di
 		_generate_district_blocks(chunk_rect, district, result, reserved, rng, detail_level)
 		_generate_roads(chunk_rect, district, result, rng, detail_level)
 
+	_fill_gaps(chunk_rect, city_seed, result, reserved, rng, detail_level)
 	_collect_occluders(result)
 	return result
+
+
+## Застройка зон, которые не покрыты ни одним реальным районом. Без этого
+## шага в середине карты остаются голые поля между кварталами.
+static func _fill_gaps(chunk_rect: Rect2, city_seed: int, result: Dictionary, reserved: Array[Rect2], rng: RandomNumberGenerator, detail_level: int) -> void:
+	var covered: Array[Rect2] = []
+	for id: String in CityAtlas.district_ids():
+		if id == "outskirts":
+			continue
+		var district: Dictionary = CityAtlas.get_district(id)
+		if district.is_empty():
+			continue
+		covered.append(district["bounds"] as Rect2)
+
+	for gap: Rect2 in NoirDistrictInfill.gaps(chunk_rect, covered):
+		var synth: Dictionary = NoirDistrictInfill.district_for(gap, city_seed)
+		if synth.is_empty():
+			continue
+		_generate_district_blocks(chunk_rect, synth, result, reserved, rng, detail_level)
+		_generate_roads(chunk_rect, synth, result, rng, detail_level)
 
 
 ## Сид чанка. Раньше здесь стояло `| 1` (страховка от нулевого сида) — и оно
@@ -110,8 +135,6 @@ static func _districts_touching(rect: Rect2) -> Array[String]:
 			continue  # окраины — фолбэк для запросов, застраивать весь мир ими нельзя
 		if bounds.intersects(rect):
 			out.append(id)
-	if out.is_empty():
-		out.append("outskirts")
 	return out
 
 
@@ -167,7 +190,15 @@ static func _fill_block(block: Rect2, district: Dictionary, result: Dictionary, 
 		var building: Dictionary = _make_building(lot, district, rng)
 		if building.is_empty():
 			continue
+
+		# Стилобат: башню поджимаем и ставим вокруг низкий объём на весь
+		# участок. Два уступа вместо одного параллелепипеда сразу убирают
+		# ощущение «коробки с окнами» и дают крышу-террасу на уровне 3-4 этажа.
+		var podium: Dictionary = _make_podium(building, district)
+
 		(result["buildings"] as Array).append(building)
+		if not podium.is_empty():
+			(result["buildings"] as Array).append(podium)
 		reserved.append(lot)
 
 		# Вывески генерируются на ВСЕХ уровнях детализации: это одна MultiMesh
@@ -178,6 +209,50 @@ static func _fill_block(block: Rect2, district: Dictionary, result: Dictionary, 
 		_add_signs(building, district, result)
 		if detail_level == 0:
 			_add_props(building, district, result)
+
+
+## Стилобат для высокого дома. Меняет [param building] на месте: башня
+## становится уже участка, чтобы низкий объём читался как отдельный уступ.
+static func _make_podium(building: Dictionary, district: Dictionary) -> Dictionary:
+	var height: float = float(building["height"])
+	if height < PODIUM_MIN_HEIGHT:
+		return {}
+
+	var rng := _deco_rng(building, 0x7F4A7C15)
+	if rng.randf() > PODIUM_CHANCE:
+		return {}
+
+	var lot: Rect2 = building["rect"]
+	var shrink: float = minf(2.8, minf(lot.size.x, lot.size.y) * 0.17)
+	if lot.size.x - shrink * 2.0 < MIN_LOT or lot.size.y - shrink * 2.0 < MIN_LOT:
+		return {}
+
+	var floors: int = rng.randi_range(2, 4)
+	var podium_height: float = clampf(float(floors) * FLOOR_HEIGHT, FLOOR_HEIGHT * 2.0, height * 0.42)
+	var center: Vector3 = building["center"]
+	var tower_lot: Rect2 = lot.grow(-shrink)
+
+	# Башня уже: стилобат выступает вокруг неё на shrink метров.
+	building["size"] = Vector3(tower_lot.size.x, height, tower_lot.size.y)
+	building["rect"] = tower_lot
+
+	var tint: Color = building["tint"]
+	var custom: Color = building["custom"]
+	return {
+		"center": Vector3(center.x, podium_height * 0.5, center.z),
+		"size": Vector3(lot.size.x, podium_height, lot.size.y),
+		"height": podium_height,
+		"floors": maxi(1, int(podium_height / FLOOR_HEIGHT)),
+		"tint": tint,
+		# У стилобата первые этажи — витрины, поэтому светящихся окон больше.
+		"custom": Color(rng.randf(), clampf(custom.g + 0.22, 0.1, 0.95), custom.b, 0.0),
+		"district": str(district["id"]),
+		"is_landmark": false,
+		"is_podium": true,
+		"location_id": "",
+		"deco_seed": rng.randi(),
+		"rect": lot,
+	}
 
 
 ## Делит квартал на 1-4 участка с переулками между ними.
@@ -210,7 +285,6 @@ static func _subdivide(block: Rect2, district: Dictionary, rng: RandomNumberGene
 		out.append(inset)
 		return out
 
-	var half_alley: float = ALLEY_WIDTH * 0.5
 	if splits == 2:
 		if rng.randf() < 0.5:
 			var w: float = (inset.size.x - ALLEY_WIDTH) * 0.5
@@ -343,7 +417,13 @@ static func _place_atlas_locations(chunk_rect: Rect2, result: Dictionary, reserv
 			"rect": lot,
 		}
 
+		# Landmark тоже получает стилобат: именно у крупных адресов плоская
+		# коробка бросалась в глаза сильнее всего.
+		var podium: Dictionary = _make_podium(building, district)
+
 		(result["buildings"] as Array).append(building)
+		if not podium.is_empty():
+			(result["buildings"] as Array).append(podium)
 		reserved.append(lot.grow(2.0))
 
 		# Вход — точка, из которой Фаза 2 открывает интерьер.
