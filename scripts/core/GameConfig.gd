@@ -44,6 +44,17 @@ const DEFAULTS: Dictionary = {
 		"allow_llm": true,
 		"force_offline_generator": false,
 	},
+	# --- ФАЗА 6: мир и время суток ---
+	# Время хранится в минутах суток (0..1439), чтобы ползунок был целочисленным
+	# и не давал накопления ошибки при переводе из часов и обратно.
+	"world": {
+		"time_of_day_min": 1260,        # 21:00 — нуар начинается ночью
+		"time_flow": 60.0,              # игровых секунд на реальную; 0 = время стоит
+		"freeze_time": false,           # заморозить сутки на выбранном часе
+		"exposure": 1.0,                # общая яркость картинки
+		"night_brightness": 1.0,        # подъём теней ночью, чтобы не было «ничего не видно»
+		"rain": 0.7,                    # сила дождя 0..1
+	},
 	"graphics": {
 		"preset": "Высокие",
 		"fsr_mode": 3,                  # 0 Performance .. 3 Native
@@ -74,6 +85,8 @@ const DEFAULTS: Dictionary = {
 		"interior_furniture": true,
 		"billboard_lights": 2,          # живых источников от вывесок на здание
 		"hide_radius_chunks": 1,        # буферное кольцо скрытых чанков
+		# Архитектурная детализация фасадов (балконы, рамы, оборудование крыш).
+		"facade_detail": 3,             # 0 коробки .. 4 кино
 	},
 	"gameplay": {
 		"difficulty_preset": "Детектив",
@@ -138,54 +151,54 @@ func _notification(what: int) -> void:
 
 # ---------------------------------------------------------------- чтение/запись
 
-func get_value(section: String, key: String) -> Variant:
-	var sect: Variant = _values.get(section, null)
+func get_value(section_name: String, key: String) -> Variant:
+	var sect: Variant = _values.get(section_name, null)
 	if sect is Dictionary and (sect as Dictionary).has(key):
 		return (sect as Dictionary)[key]
-	var fallback: Variant = _default_for(section, key)
+	var fallback: Variant = _default_for(section_name, key)
 	if fallback == null:
-		Log.warn("GameConfig", "Запрошен неизвестный ключ", {"секция": section, "ключ": key})
+		Log.warn("GameConfig", "Запрошен неизвестный ключ", {"секция": section_name, "ключ": key})
 	return fallback
 
 
-func get_bool(section: String, key: String) -> bool:
-	var v: Variant = get_value(section, key)
+func get_bool(section_name: String, key: String) -> bool:
+	var v: Variant = get_value(section_name, key)
 	return bool(v) if v != null else false
 
 
-func get_int(section: String, key: String) -> int:
-	var v: Variant = get_value(section, key)
+func get_int(section_name: String, key: String) -> int:
+	var v: Variant = get_value(section_name, key)
 	return int(v) if v != null and (v is int or v is float or v is bool) else 0
 
 
-func get_float(section: String, key: String) -> float:
-	var v: Variant = get_value(section, key)
+func get_float(section_name: String, key: String) -> float:
+	var v: Variant = get_value(section_name, key)
 	return float(v) if v != null and (v is int or v is float or v is bool) else 0.0
 
 
-func get_string(section: String, key: String) -> String:
-	var v: Variant = get_value(section, key)
+func get_string(section_name: String, key: String) -> String:
+	var v: Variant = get_value(section_name, key)
 	return str(v) if v != null else ""
 
 
 ## Ставит значение с приведением к типу дефолта. Возвращает true, если значение
 ## реально изменилось (полезно, чтобы не переприменять тяжёлые графнастройки).
-func set_value(section: String, key: String, value: Variant, save_now: bool = false) -> bool:
-	var expected: Variant = _default_for(section, key)
+func set_value(section_name: String, key: String, value: Variant, save_now: bool = false) -> bool:
+	var expected: Variant = _default_for(section_name, key)
 	if expected == null:
-		Log.warn("GameConfig", "Попытка записи неизвестного ключа — отклонена", {"секция": section, "ключ": key})
+		Log.warn("GameConfig", "Попытка записи неизвестного ключа — отклонена", {"секция": section_name, "ключ": key})
 		return false
 
 	var coerced: Variant = _coerce(value, expected)
-	if not _values.has(section):
-		_values[section] = {}
-	var sect: Dictionary = _values[section]
+	if not _values.has(section_name):
+		_values[section_name] = {}
+	var sect: Dictionary = _values[section_name]
 	if sect.has(key) and _equal(sect[key], coerced):
 		return false
 
 	sect[key] = coerced
-	setting_changed.emit(section, key, coerced)
-	Log.trace("GameConfig", "Настройка изменена", {"секция": section, "ключ": key, "значение": coerced})
+	setting_changed.emit(section_name, key, coerced)
+	Log.trace("GameConfig", "Настройка изменена", {"секция": section_name, "ключ": key, "значение": coerced})
 
 	if save_now:
 		save_settings()
@@ -195,28 +208,28 @@ func set_value(section: String, key: String, value: Variant, save_now: bool = fa
 	return true
 
 
-func section(name: String) -> Dictionary:
-	var sect: Variant = _values.get(name, null)
+func section(section_name: String) -> Dictionary:
+	var sect: Variant = _values.get(section_name, null)
 	if sect is Dictionary:
 		return (sect as Dictionary).duplicate(true)
 	return {}
 
 
-func reset_section(name: String) -> void:
-	if not DEFAULTS.has(name):
-		Log.warn("GameConfig", "Сброс неизвестной секции", {"секция": name})
+func reset_section(section_name: String) -> void:
+	if not DEFAULTS.has(section_name):
+		Log.warn("GameConfig", "Сброс неизвестной секции", {"секция": section_name})
 		return
-	_values[name] = _deep_copy(DEFAULTS[name])
-	for key: Variant in (_values[name] as Dictionary).keys():
-		setting_changed.emit(name, str(key), (_values[name] as Dictionary)[key])
+	_values[section_name] = _deep_copy(DEFAULTS[section_name])
+	for key: Variant in (_values[section_name] as Dictionary).keys():
+		setting_changed.emit(section_name, str(key), (_values[section_name] as Dictionary)[key])
 	_file_dirty = true
 	_save_timer = 0.0
-	Log.info("GameConfig", "Секция сброшена к дефолту", {"секция": name})
+	Log.info("GameConfig", "Секция сброшена к дефолту", {"секция": section_name})
 
 
 func reset_all() -> void:
-	for name: Variant in DEFAULTS.keys():
-		reset_section(str(name))
+	for section_name: Variant in DEFAULTS.keys():
+		reset_section(str(section_name))
 
 
 func load_settings() -> void:
@@ -329,8 +342,8 @@ func write_user_token(token: String) -> bool:
 
 # ------------------------------------------------------------------ утилиты
 
-func _default_for(section: String, key: String) -> Variant:
-	var sect: Variant = DEFAULTS.get(section, null)
+func _default_for(section_name: String, key: String) -> Variant:
+	var sect: Variant = DEFAULTS.get(section_name, null)
 	if sect is Dictionary and (sect as Dictionary).has(key):
 		return (sect as Dictionary)[key]
 	return null
