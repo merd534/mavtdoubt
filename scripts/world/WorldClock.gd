@@ -4,15 +4,22 @@ extends Node
 ##
 ## Нужен уже в Фазе 1: алиби, расписания NPC и записи камер оперируют минутами
 ## суток, а лимит на раскрытие дела («убийца скроется») считается по этим часам.
+##
+## ФАЗА 6. Время теперь живёт в настройках (секция `world`): игрок тянет ползунок
+## в меню — часы прыгают сразу, небо и свет перестраиваются по сигналу
+## [signal time_jumped]. Обратно в настройки текущее время пишется раз в игровой
+## час, а не каждую минуту: иначе файл настроек переписывался бы постоянно.
 
 const MINUTES_PER_DAY := 1440
 const DEFAULT_SCALE := 60.0  ## 1 реальная секунда = 1 игровая минута
 
 signal minute_changed(minutes_of_day: int)
-signal hour_changed(hour: int)
-signal day_changed(day: int)
+signal hour_changed(hour_of_day: int)
+signal day_changed(day_number: int)
 signal night_started()
 signal day_started()
+## Время переведено вручную (ползунок, катсцена, загрузка сейва).
+signal time_jumped(minutes_of_day: int)
 
 var paused: bool = false
 var time_scale: float = DEFAULT_SCALE
@@ -22,13 +29,36 @@ var _minutes: float = 21.0 * 60.0  ## Стартуем в 21:00 — нуар н�
 var _last_minute: int = -1
 var _last_hour: int = -1
 var _was_night: bool = true
+var _writing_config: bool = false
 
 
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_PAUSABLE
+
+	_apply_config()
 	_last_minute = int(_minutes)
 	_last_hour = _last_minute / 60
 	_was_night = is_night()
+
+	if GameConfig != null:
+		GameConfig.setting_changed.connect(_on_setting_changed)
+
+	Log.info("WorldClock", "Часы мира запущены", {
+		"время": time_string(),
+		"темп": time_scale,
+		"заморозка": paused,
+	})
+
+
+## Читает секцию `world` целиком. Отсутствующие ключи подменятся дефолтами
+## внутри GameConfig, так что здесь не нужны проверки на мусор.
+func _apply_config() -> void:
+	if GameConfig == null:
+		return
+	var minutes: int = clampi(GameConfig.get_int("world", "time_of_day_min"), 0, MINUTES_PER_DAY - 1)
+	_minutes = float(minutes)
+	time_scale = maxf(0.0, GameConfig.get_float("world", "time_flow"))
+	paused = GameConfig.get_bool("world", "freeze_time")
 
 
 func _process(delta: float) -> void:
@@ -57,6 +87,7 @@ func advance_minutes(amount: float) -> void:
 		if hour_now != _last_hour:
 			_last_hour = hour_now
 			hour_changed.emit(hour_now)
+			_store_time()
 
 		var night_now: bool = is_night()
 		if night_now != _was_night:
@@ -67,15 +98,46 @@ func advance_minutes(amount: float) -> void:
 				day_started.emit()
 
 
-func set_time(hour: int, minute: int = 0) -> void:
-	var h: int = clampi(hour, 0, 23)
-	var m: int = clampi(minute, 0, 59)
-	_minutes = float(h * 60 + m)
-	_last_minute = int(_minutes)
-	_last_hour = h
+func set_time(hour_value: int, minute_value: int = 0) -> void:
+	set_minutes_of_day(clampi(hour_value, 0, 23) * 60 + clampi(minute_value, 0, 59))
+
+
+## Главная точка входа для ползунка времени в меню настроек.
+func set_minutes_of_day(minutes: int) -> void:
+	var wrapped: int = ((minutes % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY
+	_minutes = float(wrapped)
+	_last_minute = wrapped
+	_last_hour = wrapped / 60
 	_was_night = is_night()
+
 	minute_changed.emit(_last_minute)
-	hour_changed.emit(h)
+	hour_changed.emit(_last_hour)
+	time_jumped.emit(_last_minute)
+	_store_time()
+
+
+## Пишет текущее время в настройки. Флаг `_writing_config` гасит обратную
+## реакцию на setting_changed, иначе часы будут сами себя переводить.
+func _store_time() -> void:
+	if GameConfig == null:
+		return
+	_writing_config = true
+	GameConfig.set_value("world", "time_of_day_min", int(_minutes))
+	_writing_config = false
+
+
+func _on_setting_changed(section_name: String, key: String, value: Variant) -> void:
+	if section_name != "world" or _writing_config:
+		return
+	match key:
+		"time_of_day_min":
+			var minutes: int = clampi(int(value), 0, MINUTES_PER_DAY - 1)
+			if minutes != int(_minutes):
+				set_minutes_of_day(minutes)
+		"time_flow":
+			time_scale = maxf(0.0, float(value))
+		"freeze_time":
+			paused = bool(value)
 
 
 func day() -> int:
@@ -101,6 +163,20 @@ func total_minutes_elapsed() -> int:
 func is_night() -> bool:
 	var h: int = hour()
 	return h >= 20 or h < 6
+
+
+## Доля светлого времени 0..1: 0 — глухая ночь (03:00), 1 — полдень.
+## Используется освещением сцены для плавного рассвета и заката.
+func daylight() -> float:
+	var phase: float = float(_minutes) / float(MINUTES_PER_DAY)
+	# Косинусоида с минимумом в 03:00 и максимумом в 15:00.
+	var raw: float = 0.5 - 0.5 * cos((phase - 0.125) * TAU)
+	return clampf(raw, 0.0, 1.0)
+
+
+## Угол солнца/луны над горизонтом в градусах: -90 надир, 0 горизонт, 90 зенит.
+func sun_elevation_deg() -> float:
+	return -90.0 + 180.0 * daylight()
 
 
 func time_string() -> String:
