@@ -2,14 +2,14 @@ class_name NoirCityChunk
 extends Node3D
 ## Один чанк города. Превращает данные фабрик в узлы сцены.
 ##
-## Бюджет вызовов отрисовки на чанк держится около двух десятков независимо от
+## Бюджет вызовов отрисовки на чанк держится около трёх десятков независимо от
 ## того, сколько в нём зданий, деталей и уличного реквизита: всё однотипное
 ## сливается в MultiMesh.
 ##
 ## Уровни детализации:
 ##   0 — вблизи: архитектурная детализация, подворотни, улицы, частицы,
 ##       зоны лазания, коллизии, настоящие источники света, входы
-##   1 — средне: здания, объём и карнизы, вывески, столбы
+##   1 — средне: здания, объём и карнизы, вывески, столбы, силуэт башен
 ##   2 — далеко: только здания и полотно дорог
 ##
 ## [method set_hidden] убирает чанк из отрисовки и физики, не разбирая геометрию.
@@ -21,6 +21,7 @@ const DETAIL_FAR := 2
 const MAX_REAL_LIGHTS := 6            ## живых OmniLight3D от фонарей на ближний чанк
 const MAX_DETAIL_LIGHTS := 8          ## живых источников от неона и подворотен
 const MAX_STREET_LIGHTS := 3          ## живых источников от киосков и светофоров
+const MAX_TOWER_LIGHTS := 2           ## маячки на шпилях небоскрёбов
 const MAX_PARTICLE_SYSTEMS := 10      ## GPU-эмиттеров на чанк
 const MAX_CLIMB_ZONES := 12
 const PROP_VISIBLE_TO := 240.0
@@ -29,6 +30,7 @@ const TRIM_VISIBLE_TO := 190.0         ## мелкий декор фасада
 const SMALL_DETAIL_VISIBLE_TO := 120.0 ## кабели, щитки, мусор
 const STREET_VISIBLE_TO := 210.0       ## уличный реквизит
 const STREET_SMALL_VISIBLE_TO := 130.0 ## мелочь на тротуарах
+const TOWER_SMALL_VISIBLE_TO := 520.0  ## оборудование на крышах башен
 
 var coords: Vector2i = Vector2i.ZERO
 var rect: Rect2 = Rect2()
@@ -54,6 +56,7 @@ var _lights: Array[OmniLight3D] = []
 
 var _detail_nodes: Array[MultiMeshInstance3D] = []
 var _detail_lights: Array[OmniLight3D] = []
+var _tower_lights: Array[OmniLight3D] = []
 var _particles: Array[GPUParticles3D] = []
 var _climb_areas: Array[NoirClimbArea] = []
 var _detail_boxes: Array[Dictionary] = []   ## боксы для коллизий деталей
@@ -138,6 +141,9 @@ func _apply_hidden(hide_chunk: bool) -> void:
 	for light: OmniLight3D in _detail_lights:
 		if is_instance_valid(light):
 			light.visible = not hide_chunk
+	for light: OmniLight3D in _tower_lights:
+		if is_instance_valid(light):
+			light.visible = not hide_chunk
 
 	if _body != null and is_instance_valid(_body):
 		_body.collision_layer = 0 if hide_chunk else 1
@@ -175,7 +181,7 @@ func stats() -> Dictionary:
 		"signs": _count("signs"),
 		"props": _count("props"),
 		"lamps": _count("lamps"),
-		"lights": _lights.size() + _detail_lights.size(),
+		"lights": _lights.size() + _detail_lights.size() + _tower_lights.size(),
 		"particles": _particles.size(),
 		"climb_zones": _climb_areas.size(),
 		"occluders": _count("occluders") + _detail_occluders.size(),
@@ -221,6 +227,7 @@ func _clear_nodes() -> void:
 	_lights.clear()
 	_detail_nodes.clear()
 	_detail_lights.clear()
+	_tower_lights.clear()
 	_particles.clear()
 	_climb_areas.clear()
 	_detail_boxes.clear()
@@ -283,12 +290,37 @@ func _detail_budget() -> Dictionary:
 	return cfg
 
 
+## Конфиг объёмной детализации небоскрёбов. Плотность берётся из пресета, но
+## силуэт башни нужен даже на слабых машинах: минимум оставляем заметным.
+func _tower_config() -> Dictionary:
+	var cfg: Dictionary = NoirTowerDetailer.defaults()
+	var graphics: Dictionary = GameConfig.section("graphics")
+	var density: float = 1.0
+	if not graphics.is_empty():
+		density = clampf(float(graphics.get("detail_density", 1.0)), 0.0, 1.5)
+	cfg["density"] = clampf(density, 0.0, 1.5)
+
+	# На средней дистанции нужны только крупные объёмы: подиум, уступы, венец.
+	if detail_level != DETAIL_NEAR:
+		cfg["roof_gear"] = density >= 0.8
+		cfg["fins"] = density >= 0.55
+		cfg["neon"] = density >= 0.35
+
+	if density < 0.35:
+		cfg["fins"] = false
+		cfg["roof_gear"] = false
+
+	cfg["max_parts"] = maxi(40, int(round(float(NoirTowerDetailer.MAX_PARTS) * clampf(0.35 + density * 0.65, 0.35, 1.0))))
+	return cfg
+
+
 func _build_details() -> void:
 	var buildings: Array = _content.get("buildings", [])
 	if buildings.is_empty() or detail_level >= DETAIL_FAR:
 		return
 
 	var budget: Dictionary = _detail_budget()
+	var tower_cfg: Dictionary = _tower_config()
 	if float(budget.get("density", 0.0)) <= 0.01:
 		return
 
@@ -313,52 +345,98 @@ func _build_details() -> void:
 	var lights: Array[Dictionary] = []
 	var climb: Array[Dictionary] = []
 
+	# Небоскрёбы: отдельные слои, потому что их геометрия видна далеко и
+	# не должна отсекаться вместе с мелочью фасада.
+	var tower_concrete: Array[Transform3D] = []
+	var tower_metal: Array[Transform3D] = []
+	var tower_glass: Array[Transform3D] = []
+	var tower_poles: Array[Transform3D] = []
+	var tower_neon: Array[Transform3D] = []
+	var tower_neon_colors: Array[Color] = []
+	var tower_neon_customs: Array[Color] = []
+	var tower_lights: Array[Dictionary] = []
+	var tower_parts: int = 0
+	var towers: int = 0
+
 	for entry: Variant in buildings:
 		if not (entry is Dictionary):
 			continue
 		var b: Dictionary = entry as Dictionary
 		var district: Variant = CityAtlas.get_district(str(b.get("district", "")))
 		var result: Dictionary = NoirBuildingDetailer.detail(b, district, budget)
-		if result.is_empty():
+		if not result.is_empty():
+			for item: Variant in result.get("masses", []) as Array:
+				var mass: Dictionary = item as Dictionary
+				masses.append(mass["transform"])
+				mass_colors.append(mass["tint"])
+				mass_customs.append(mass["custom"])
+				_detail_boxes.append({"transform": mass["transform"]})
+
+			trims.append_array(result.get("trims", []) as Array)
+			fixtures.append_array(result.get("fixtures", []) as Array)
+			pipes.append_array(result.get("pipes", []) as Array)
+			cables.append_array(result.get("cables", []) as Array)
+			ladders.append_array(result.get("ladders", []) as Array)
+			drips.append_array(result.get("drips", []) as Array)
+			_detail_occluders.append_array(result.get("occluders", []) as Array)
+
+			for item: Variant in result.get("niches", []) as Array:
+				var niche: Dictionary = item as Dictionary
+				niches.append(niche["transform"])
+				niche_colors.append(niche["tint"])
+				niche_customs.append(niche["custom"])
+
+			for item: Variant in result.get("billboards", []) as Array:
+				var sign_data: Dictionary = item as Dictionary
+				billboards.append(sign_data["transform"])
+				billboard_colors.append(sign_data["tint"])
+				billboard_customs.append(sign_data["custom"])
+
+			for item: Variant in result.get("holograms", []) as Array:
+				var holo: Dictionary = item as Dictionary
+				holograms.append(holo["transform"])
+				holo_colors.append(holo["tint"])
+				holo_customs.append(holo["custom"])
+
+			if lights.size() < MAX_DETAIL_LIGHTS:
+				lights.append_array(result.get("lights", []) as Array)
+			if detail_level == DETAIL_NEAR and climb.size() < MAX_CLIMB_ZONES:
+				climb.append_array(result.get("climb_zones", []) as Array)
+
+		# ---- объёмная архитектура высоток
+		if not NoirTowerDetailer.is_tower(b):
 			continue
+		var tower: Dictionary = NoirTowerDetailer.detail(b, tower_cfg)
+		if tower.is_empty():
+			continue
+		towers += 1
+		tower_parts += NoirTowerDetailer.count(tower)
 
-		for item: Variant in result.get("masses", []) as Array:
-			var mass: Dictionary = item as Dictionary
-			masses.append(mass["transform"])
-			mass_colors.append(mass["tint"])
-			mass_customs.append(mass["custom"])
-			_detail_boxes.append({"transform": mass["transform"]})
+		# Крупные объёмы башни идут тем же материалом фасада: уступы и подиум
+		# получают окна и продолжают читаться как часть здания.
+		for item: Variant in tower.get("masses", []) as Array:
+			var tower_mass: Dictionary = item as Dictionary
+			masses.append(tower_mass["transform"])
+			mass_colors.append(tower_mass.get("tint", b.get("tint", Color.WHITE)))
+			mass_customs.append(tower_mass.get("custom", b.get("custom", Color(0.0, 0.5, 0.0, 0.0))))
 
-		trims.append_array(result.get("trims", []) as Array)
-		fixtures.append_array(result.get("fixtures", []) as Array)
-		pipes.append_array(result.get("pipes", []) as Array)
-		cables.append_array(result.get("cables", []) as Array)
-		ladders.append_array(result.get("ladders", []) as Array)
-		drips.append_array(result.get("drips", []) as Array)
-		_detail_occluders.append_array(result.get("occluders", []) as Array)
+		tower_concrete.append_array(tower.get("concrete", []) as Array)
+		tower_metal.append_array(tower.get("metal", []) as Array)
+		tower_glass.append_array(tower.get("glass", []) as Array)
+		tower_poles.append_array(tower.get("poles", []) as Array)
+		_detail_occluders.append_array(tower.get("occluders", []) as Array)
 
-		for item: Variant in result.get("niches", []) as Array:
-			var niche: Dictionary = item as Dictionary
-			niches.append(niche["transform"])
-			niche_colors.append(niche["tint"])
-			niche_customs.append(niche["custom"])
+		for item: Variant in tower.get("neon", []) as Array:
+			var strip: Dictionary = item as Dictionary
+			tower_neon.append(strip["transform"])
+			tower_neon_colors.append(strip.get("tint", Color.WHITE))
+			tower_neon_customs.append(strip.get("custom", Color(0.0, 0.9, 0.0, 0.0)))
 
-		for item: Variant in result.get("billboards", []) as Array:
-			var sign_data: Dictionary = item as Dictionary
-			billboards.append(sign_data["transform"])
-			billboard_colors.append(sign_data["tint"])
-			billboard_customs.append(sign_data["custom"])
-
-		for item: Variant in result.get("holograms", []) as Array:
-			var holo: Dictionary = item as Dictionary
-			holograms.append(holo["transform"])
-			holo_colors.append(holo["tint"])
-			holo_customs.append(holo["custom"])
-
-		if lights.size() < MAX_DETAIL_LIGHTS:
-			lights.append_array(result.get("lights", []) as Array)
-		if detail_level == DETAIL_NEAR and climb.size() < MAX_CLIMB_ZONES:
-			climb.append_array(result.get("climb_zones", []) as Array)
+		if detail_level == DETAIL_NEAR:
+			for xform: Transform3D in tower.get("boxes", []) as Array:
+				_detail_boxes.append({"transform": xform})
+		if tower_lights.size() < MAX_TOWER_LIGHTS * 4:
+			tower_lights.append_array(tower.get("lights", []) as Array)
 
 	var alley: Dictionary = {}
 	if detail_level == DETAIL_NEAR:
@@ -371,6 +449,11 @@ func _build_details() -> void:
 		billboards, billboard_colors, billboard_customs,
 		holograms, holo_colors, holo_customs
 	)
+	_emit_tower_meshes(
+		tower_concrete, tower_metal, tower_glass, tower_poles,
+		tower_neon, tower_neon_colors, tower_neon_customs
+	)
+	_emit_tower_lights(tower_lights)
 	_emit_alley(alley)
 	_emit_detail_lights(lights, alley)
 	if detail_level == DETAIL_NEAR:
@@ -387,6 +470,8 @@ func _build_details() -> void:
 		"detail_ladders": ladders.size(),
 		"detail_billboards": billboards.size(),
 		"detail_holograms": holograms.size(),
+		"towers": towers,
+		"tower_parts": tower_parts,
 	}
 
 
@@ -406,6 +491,47 @@ func _emit_detail_meshes(
 	_emit_multimesh("Ladders", CityMaterials.box_mesh(), CityMaterials.metal_rust, ladders, [], [], false, TRIM_VISIBLE_TO)
 	_emit_multimesh("Billboards", CityMaterials.box_mesh(), CityMaterials.billboard, billboards, billboard_colors, billboard_customs, false, 0.0)
 	_emit_multimesh("Holograms", CityMaterials.quad_mesh(), CityMaterials.hologram, holograms, holo_colors, holo_customs, false, 0.0)
+
+
+## Слои небоскрёбов. Пилястры, карнизы и венцы не отсекаются по дистанции:
+## именно они ломают силуэт коробки, и терять их на 200 метрах нельзя.
+func _emit_tower_meshes(
+	concrete: Array[Transform3D], metal: Array[Transform3D], glass: Array[Transform3D],
+	poles: Array[Transform3D], neon: Array[Transform3D],
+	neon_colors: Array[Color], neon_customs: Array[Color]
+) -> void:
+	_emit_multimesh("TowerConcrete", CityMaterials.box_mesh(), CityMaterials.concrete, concrete, [], [], true, 0.0)
+	_emit_multimesh("TowerGlass", CityMaterials.box_mesh(), CityMaterials.glass, glass, [], [], false, 0.0)
+	_emit_multimesh("TowerMetal", CityMaterials.box_mesh(), CityMaterials.metal, metal, [], [], false, TOWER_SMALL_VISIBLE_TO)
+	_emit_multimesh("TowerPoles", CityMaterials.cylinder_mesh(), CityMaterials.metal, poles, [], [], false, TOWER_SMALL_VISIBLE_TO)
+	_emit_multimesh("TowerNeon", CityMaterials.box_mesh(), CityMaterials.neon, neon, neon_colors, neon_customs, false, 0.0)
+
+
+## Маячки на шпилях. Их единицы на чанк: свет дорогой, а читаются они
+## в основном за счёт неонового материала.
+func _emit_tower_lights(lights: Array[Dictionary]) -> void:
+	if lights.is_empty():
+		return
+	var made: int = 0
+	var step: int = maxi(1, int(ceil(float(lights.size()) / float(MAX_TOWER_LIGHTS))))
+	var index: int = 0
+	while index < lights.size() and made < MAX_TOWER_LIGHTS:
+		var data: Dictionary = lights[index]
+		var light := OmniLight3D.new()
+		light.name = "TowerBeacon_%d" % made
+		light.position = data.get("position", Vector3.ZERO)
+		light.light_color = data.get("color", Color(1.0, 0.2, 0.25))
+		light.light_energy = clampf(float(data.get("energy", 2.0)), 0.2, 8.0)
+		light.omni_range = clampf(float(data.get("range", 18.0)), 3.0, 60.0)
+		light.omni_attenuation = 1.6
+		light.shadow_enabled = false
+		light.distance_fade_enabled = true
+		light.distance_fade_begin = 260.0
+		light.distance_fade_length = 90.0
+		add_child(light)
+		_tower_lights.append(light)
+		made += 1
+		index += step
 
 
 func _emit_alley(alley: Dictionary) -> void:
