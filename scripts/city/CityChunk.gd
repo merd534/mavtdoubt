@@ -7,9 +7,13 @@ extends Node3D
 ## сливается в MultiMesh.
 ##
 ## Уровни детализации:
-##   0 — вблизи: архитектурная детализация, подворотни, улицы, частицы,
-##       зоны лазания, коллизии, настоящие источники света, входы
-##   1 — средне: здания, объём и карнизы, вывески, столбы, силуэт башен
+##   0 — вблизи: архитектурная детализация, подворотни, улицы, тротуары,
+##       частицы, зоны лазания, коллизии, настоящие источники света, входы
+##   1 — средне: здания, крупные объёмы, силуэт башен, вывески, столбы,
+##       тротуары и разметка. Мелочь фасада тут не строится вообще: её
+##       дистанция видимости (120-190 м) заведомо меньше расстояния до
+##       среднего чанка, так что раньше она грузила память и шину, но не
+##       появлялась на экране ни одним пикселем.
 ##   2 — далеко: только здания и полотно дорог
 ##
 ## [method set_hidden] убирает чанк из отрисовки и физики, не разбирая геометрию.
@@ -22,6 +26,7 @@ const MAX_REAL_LIGHTS := 6            ## живых OmniLight3D от фонар�
 const MAX_DETAIL_LIGHTS := 8          ## живых источников от неона и подворотен
 const MAX_STREET_LIGHTS := 3          ## живых источников от киосков и светофоров
 const MAX_TOWER_LIGHTS := 2           ## маячки на шпилях небоскрёбов
+const MAX_WALK_LIGHTS := 2            ## подсветка витрин на тротуарах
 const MAX_PARTICLE_SYSTEMS := 10      ## GPU-эмиттеров на чанк
 const MAX_CLIMB_ZONES := 12
 const PROP_VISIBLE_TO := 240.0
@@ -31,6 +36,19 @@ const SMALL_DETAIL_VISIBLE_TO := 120.0 ## кабели, щитки, мусор
 const STREET_VISIBLE_TO := 210.0       ## уличный реквизит
 const STREET_SMALL_VISIBLE_TO := 130.0 ## мелочь на тротуарах
 const TOWER_SMALL_VISIBLE_TO := 520.0  ## оборудование на крышах башен
+const MASS_SMALL_VISIBLE_TO := 330.0   ## мелкие объёмы фасада: эркеры, подоконники
+const SIDEWALK_VISIBLE_TO := 430.0     ## плиты тротуаров и бордюры
+const PAINT_VISIBLE_TO := 270.0        ## дорожная разметка
+const WALK_PROP_VISIBLE_TO := 155.0    ## люки, вазоны, столбики, шкафы
+
+## Порог «крупного» объёма. Всё, что меньше, не отбрасывает тень: на экране
+## такая тень занимает доли пикселя, а в проход теней уходит полноценный
+## инстанс. Это главный источник просадки после детализации фасадов.
+const MASS_SHADOW_MIN_HEIGHT := 3.5
+const MASS_SHADOW_MIN_SIDE := 1.6
+
+## Материал дорожной разметки. Один на всю игру: краска не зависит от чанка.
+static var _paint_material: StandardMaterial3D = null
 
 var coords: Vector2i = Vector2i.ZERO
 var rect: Rect2 = Rect2()
@@ -57,6 +75,7 @@ var _lights: Array[OmniLight3D] = []
 var _detail_nodes: Array[MultiMeshInstance3D] = []
 var _detail_lights: Array[OmniLight3D] = []
 var _tower_lights: Array[OmniLight3D] = []
+var _walk_lights: Array[OmniLight3D] = []
 var _particles: Array[GPUParticles3D] = []
 var _climb_areas: Array[NoirClimbArea] = []
 var _detail_boxes: Array[Dictionary] = []   ## боксы для коллизий деталей
@@ -73,6 +92,20 @@ static func create(chunk_coords: Vector2i, chunk_rect: Rect2, detail: int) -> No
 	return chunk
 
 
+## Материал краски создаётся один раз и переиспользуется всеми чанками.
+static func paint_material() -> StandardMaterial3D:
+	if _paint_material != null:
+		return _paint_material
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.56, 0.54, 0.48)
+	mat.roughness = 0.78
+	mat.metallic = 0.0
+	mat.metallic_specular = 0.35
+	mat.cull_mode = BaseMaterial3D.CULL_BACK
+	_paint_material = mat
+	return _paint_material
+
+
 ## Строит содержимое. Возвращает время сборки в миллисекундах.
 func build(city_seed: int) -> int:
 	var started: int = Time.get_ticks_usec()
@@ -85,6 +118,7 @@ func build(city_seed: int) -> int:
 	_build_signs()
 	_build_lamps()
 	_build_details()
+	_build_sidewalks()
 	if detail_level == DETAIL_NEAR:
 		# Улицы строятся до коллизий: машины и киоски должны быть твёрдыми.
 		_build_streets()
@@ -144,6 +178,9 @@ func _apply_hidden(hide_chunk: bool) -> void:
 	for light: OmniLight3D in _tower_lights:
 		if is_instance_valid(light):
 			light.visible = not hide_chunk
+	for light: OmniLight3D in _walk_lights:
+		if is_instance_valid(light):
+			light.visible = not hide_chunk
 
 	if _body != null and is_instance_valid(_body):
 		_body.collision_layer = 0 if hide_chunk else 1
@@ -181,7 +218,7 @@ func stats() -> Dictionary:
 		"signs": _count("signs"),
 		"props": _count("props"),
 		"lamps": _count("lamps"),
-		"lights": _lights.size() + _detail_lights.size() + _tower_lights.size(),
+		"lights": _lights.size() + _detail_lights.size() + _tower_lights.size() + _walk_lights.size(),
 		"particles": _particles.size(),
 		"climb_zones": _climb_areas.size(),
 		"occluders": _count("occluders") + _detail_occluders.size(),
@@ -228,6 +265,7 @@ func _clear_nodes() -> void:
 	_detail_nodes.clear()
 	_detail_lights.clear()
 	_tower_lights.clear()
+	_walk_lights.clear()
 	_particles.clear()
 	_climb_areas.clear()
 	_detail_boxes.clear()
@@ -274,19 +312,30 @@ func _detail_budget() -> Dictionary:
 	cfg["level"] = detail_level
 
 	var graphics: Dictionary = GameConfig.section("graphics")
-	if graphics.is_empty():
-		return cfg
+	if not graphics.is_empty():
+		cfg["density"] = clampf(float(graphics.get("detail_density", cfg["density"])), 0.0, 1.0)
+		cfg["cables"] = bool(graphics.get("cables", cfg["cables"]))
+		cfg["steam"] = bool(graphics.get("steam", cfg["steam"]))
+		cfg["debris"] = bool(graphics.get("debris", cfg["debris"]))
+		cfg["drips"] = bool(graphics.get("steam", cfg["drips"]))
+		cfg["billboard_lights"] = maxi(0, int(graphics.get("billboard_lights", cfg["billboard_lights"])))
 
-	cfg["density"] = clampf(float(graphics.get("detail_density", cfg["density"])), 0.0, 1.0)
-	cfg["cables"] = bool(graphics.get("cables", cfg["cables"]))
-	cfg["steam"] = bool(graphics.get("steam", cfg["steam"]))
-	cfg["debris"] = bool(graphics.get("debris", cfg["debris"]))
-	cfg["drips"] = bool(graphics.get("steam", cfg["drips"]))
-	cfg["billboard_lights"] = maxi(0, int(graphics.get("billboard_lights", cfg["billboard_lights"])))
 	var density: float = float(cfg["density"])
 	cfg["niches"] = density > 0.25
 	cfg["holograms"] = density > 0.15
 	cfg["max_elements"] = maxi(24, int(round(float(NoirBuildingDetailer.MAX_ELEMENTS) * clampf(0.3 + density, 0.3, 1.0))))
+
+	# Средний чанк начинается в 240 метрах, а мелочь фасада отсекается на
+	# 120-190. Раньше она всё равно генерировалась и уходила в видеопамять:
+	# чистая потеря без единого видимого пикселя.
+	if detail_level != DETAIL_NEAR:
+		cfg["cables"] = false
+		cfg["steam"] = false
+		cfg["debris"] = false
+		cfg["drips"] = false
+		cfg["niches"] = false
+		cfg["max_elements"] = maxi(16, int(round(float(cfg["max_elements"]) * 0.4)))
+
 	return cfg
 
 
@@ -319,14 +368,20 @@ func _build_details() -> void:
 	if buildings.is_empty() or detail_level >= DETAIL_FAR:
 		return
 
+	var near: bool = detail_level == DETAIL_NEAR
 	var budget: Dictionary = _detail_budget()
 	var tower_cfg: Dictionary = _tower_config()
 	if float(budget.get("density", 0.0)) <= 0.01:
 		return
 
+	# Крупные и мелкие объёмы разводятся по разным узлам: первые дают тень и
+	# силуэт, вторые видны только вблизи и в проходе теней не участвуют.
 	var masses: Array[Transform3D] = []
 	var mass_colors: Array[Color] = []
 	var mass_customs: Array[Color] = []
+	var small_masses: Array[Transform3D] = []
+	var small_colors: Array[Color] = []
+	var small_customs: Array[Color] = []
 	var trims: Array[Transform3D] = []
 	var niches: Array[Transform3D] = []
 	var niche_colors: Array[Color] = []
@@ -367,24 +422,34 @@ func _build_details() -> void:
 		if not result.is_empty():
 			for item: Variant in result.get("masses", []) as Array:
 				var mass: Dictionary = item as Dictionary
-				masses.append(mass["transform"])
-				mass_colors.append(mass["tint"])
-				mass_customs.append(mass["custom"])
-				_detail_boxes.append({"transform": mass["transform"]})
+				var xf: Transform3D = mass["transform"]
+				if _is_big_mass(xf):
+					masses.append(xf)
+					mass_colors.append(mass["tint"])
+					mass_customs.append(mass["custom"])
+				else:
+					small_masses.append(xf)
+					small_colors.append(mass["tint"])
+					small_customs.append(mass["custom"])
+				if near:
+					_detail_boxes.append({"transform": xf})
 
-			trims.append_array(result.get("trims", []) as Array)
-			fixtures.append_array(result.get("fixtures", []) as Array)
-			pipes.append_array(result.get("pipes", []) as Array)
-			cables.append_array(result.get("cables", []) as Array)
-			ladders.append_array(result.get("ladders", []) as Array)
-			drips.append_array(result.get("drips", []) as Array)
 			_detail_occluders.append_array(result.get("occluders", []) as Array)
 
-			for item: Variant in result.get("niches", []) as Array:
-				var niche: Dictionary = item as Dictionary
-				niches.append(niche["transform"])
-				niche_colors.append(niche["tint"])
-				niche_customs.append(niche["custom"])
+			# Мелочь фасада живёт только в ближнем чанке.
+			if near:
+				trims.append_array(result.get("trims", []) as Array)
+				fixtures.append_array(result.get("fixtures", []) as Array)
+				pipes.append_array(result.get("pipes", []) as Array)
+				cables.append_array(result.get("cables", []) as Array)
+				ladders.append_array(result.get("ladders", []) as Array)
+				drips.append_array(result.get("drips", []) as Array)
+
+				for item: Variant in result.get("niches", []) as Array:
+					var niche: Dictionary = item as Dictionary
+					niches.append(niche["transform"])
+					niche_colors.append(niche["tint"])
+					niche_customs.append(niche["custom"])
 
 			for item: Variant in result.get("billboards", []) as Array:
 				var sign_data: Dictionary = item as Dictionary
@@ -400,7 +465,7 @@ func _build_details() -> void:
 
 			if lights.size() < MAX_DETAIL_LIGHTS:
 				lights.append_array(result.get("lights", []) as Array)
-			if detail_level == DETAIL_NEAR and climb.size() < MAX_CLIMB_ZONES:
+			if near and climb.size() < MAX_CLIMB_ZONES:
 				climb.append_array(result.get("climb_zones", []) as Array)
 
 		# ---- объёмная архитектура высоток
@@ -432,18 +497,19 @@ func _build_details() -> void:
 			tower_neon_colors.append(strip.get("tint", Color.WHITE))
 			tower_neon_customs.append(strip.get("custom", Color(0.0, 0.9, 0.0, 0.0)))
 
-		if detail_level == DETAIL_NEAR:
+		if near:
 			for xform: Transform3D in tower.get("boxes", []) as Array:
 				_detail_boxes.append({"transform": xform})
 		if tower_lights.size() < MAX_TOWER_LIGHTS * 4:
 			tower_lights.append_array(tower.get("lights", []) as Array)
 
 	var alley: Dictionary = {}
-	if detail_level == DETAIL_NEAR:
+	if near:
 		alley = NoirAlleyDresser.generate(buildings, _city_seed, budget)
 
 	_emit_detail_meshes(
 		masses, mass_colors, mass_customs,
+		small_masses, small_colors, small_customs,
 		trims, niches, niche_colors, niche_customs,
 		fixtures, pipes, cables, ladders,
 		billboards, billboard_colors, billboard_customs,
@@ -456,12 +522,13 @@ func _build_details() -> void:
 	_emit_tower_lights(tower_lights)
 	_emit_alley(alley)
 	_emit_detail_lights(lights, alley)
-	if detail_level == DETAIL_NEAR:
+	if near:
 		_emit_particles(drips, alley, float(budget.get("density", 0.7)))
 		_emit_climb_zones(climb)
 
 	_detail_stats = {
-		"detail_masses": masses.size(),
+		"detail_masses": masses.size() + small_masses.size(),
+		"detail_shadow_masses": masses.size(),
 		"detail_trims": trims.size(),
 		"detail_niches": niches.size(),
 		"detail_fixtures": fixtures.size(),
@@ -475,14 +542,23 @@ func _build_details() -> void:
 	}
 
 
+## Крупный ли объём. Тень имеет смысл только у того, что заметно на фасаде.
+func _is_big_mass(xform: Transform3D) -> bool:
+	var h: float = xform.basis.y.length()
+	var side: float = minf(xform.basis.x.length(), xform.basis.z.length())
+	return h >= MASS_SHADOW_MIN_HEIGHT and side >= MASS_SHADOW_MIN_SIDE
+
+
 func _emit_detail_meshes(
 	masses: Array[Transform3D], mass_colors: Array[Color], mass_customs: Array[Color],
+	small_masses: Array[Transform3D], small_colors: Array[Color], small_customs: Array[Color],
 	trims: Array[Transform3D], niches: Array[Transform3D], niche_colors: Array[Color], niche_customs: Array[Color],
 	fixtures: Array[Transform3D], pipes: Array[Transform3D], cables: Array[Transform3D], ladders: Array[Transform3D],
 	billboards: Array[Transform3D], billboard_colors: Array[Color], billboard_customs: Array[Color],
 	holograms: Array[Transform3D], holo_colors: Array[Color], holo_customs: Array[Color]
 ) -> void:
 	_emit_multimesh("Massing", CityMaterials.box_mesh(), CityMaterials.facade, masses, mass_colors, mass_customs, true, 0.0)
+	_emit_multimesh("MassingSmall", CityMaterials.box_mesh(), CityMaterials.facade, small_masses, small_colors, small_customs, false, MASS_SMALL_VISIBLE_TO)
 	_emit_multimesh("Trims", CityMaterials.box_mesh(), CityMaterials.concrete, trims, [], [], false, TRIM_VISIBLE_TO)
 	_emit_multimesh("Niches", CityMaterials.quad_mesh(), CityMaterials.glass, niches, niche_colors, niche_customs, false, TRIM_VISIBLE_TO)
 	_emit_multimesh("Fixtures", CityMaterials.box_mesh(), CityMaterials.metal_rust, fixtures, [], [], false, SMALL_DETAIL_VISIBLE_TO)
@@ -495,12 +571,15 @@ func _emit_detail_meshes(
 
 ## Слои небоскрёбов. Пилястры, карнизы и венцы не отсекаются по дистанции:
 ## именно они ломают силуэт коробки, и терять их на 200 метрах нельзя.
+## Тень от бетонных элементов включена только вблизи: дальше карта теней
+## всё равно заканчивается, а инстансы в проход теней уходили.
 func _emit_tower_meshes(
 	concrete: Array[Transform3D], metal: Array[Transform3D], glass: Array[Transform3D],
 	poles: Array[Transform3D], neon: Array[Transform3D],
 	neon_colors: Array[Color], neon_customs: Array[Color]
 ) -> void:
-	_emit_multimesh("TowerConcrete", CityMaterials.box_mesh(), CityMaterials.concrete, concrete, [], [], true, 0.0)
+	var concrete_shadows: bool = detail_level == DETAIL_NEAR
+	_emit_multimesh("TowerConcrete", CityMaterials.box_mesh(), CityMaterials.concrete, concrete, [], [], concrete_shadows, 0.0)
 	_emit_multimesh("TowerGlass", CityMaterials.box_mesh(), CityMaterials.glass, glass, [], [], false, 0.0)
 	_emit_multimesh("TowerMetal", CityMaterials.box_mesh(), CityMaterials.metal, metal, [], [], false, TOWER_SMALL_VISIBLE_TO)
 	_emit_multimesh("TowerPoles", CityMaterials.cylinder_mesh(), CityMaterials.metal, poles, [], [], false, TOWER_SMALL_VISIBLE_TO)
@@ -552,11 +631,112 @@ func _emit_alley(alley: Dictionary) -> void:
 		_detail_boxes.append({"transform": xform})
 
 
+# =========================================================== тротуары
+
+## Тротуары, бордюры, разметка и переходы. Строятся и вблизи, и на средней
+## дистанции: без них город с высоты выглядит набором коробок на чёрном поле.
+## Мелкий реквизит тротуара и подсветка витрин — только вблизи.
+func _build_sidewalks() -> void:
+	var roads: Array = _content.get("roads", [])
+	if roads.is_empty() or detail_level >= DETAIL_FAR:
+		return
+
+	var near: bool = detail_level == DETAIL_NEAR
+	var cfg: Dictionary = NoirSidewalkBuilder.defaults()
+	var density: float = 1.0
+	var graphics: Dictionary = GameConfig.section("graphics")
+	if not graphics.is_empty():
+		density = clampf(float(graphics.get("detail_density", 1.0)), 0.0, 1.5)
+	if density <= 0.02:
+		return
+
+	cfg["density"] = density
+	cfg["props"] = near and density > 0.15
+	cfg["signs"] = near and density > 0.1
+	cfg["crosswalks"] = density > 0.05
+	# Разметки на средней дистанции нужно меньше: осевая видна и с высоты,
+	# а отдельные штрихи перехода — нет.
+	cfg["max_paint"] = int(round(float(NoirSidewalkBuilder.MAX_PAINT) * (1.0 if near else 0.45)))
+	cfg["max_slabs"] = int(round(float(NoirSidewalkBuilder.MAX_SLABS) * clampf(0.5 + density * 0.5, 0.5, 1.0)))
+	cfg["max_props"] = int(round(float(NoirSidewalkBuilder.MAX_PROPS) * clampf(density, 0.2, 1.0)))
+
+	var walk: Dictionary = NoirSidewalkBuilder.generate(roads, _city_seed, coords, cfg)
+	if walk.is_empty():
+		return
+
+	var slabs: Array[Transform3D] = []
+	var curbs: Array[Transform3D] = []
+	var paint: Array[Transform3D] = []
+	var metal: Array[Transform3D] = []
+	var poles: Array[Transform3D] = []
+	var props: Array[Transform3D] = []
+	slabs.append_array(walk.get("slabs", []) as Array)
+	curbs.append_array(walk.get("curbs", []) as Array)
+	paint.append_array(walk.get("paint", []) as Array)
+	metal.append_array(walk.get("metal", []) as Array)
+	poles.append_array(walk.get("poles", []) as Array)
+	props.append_array(walk.get("props", []) as Array)
+
+	var signs: Array[Transform3D] = []
+	var sign_colors: Array[Color] = []
+	var sign_customs: Array[Color] = []
+	for entry: Variant in walk.get("signs", []) as Array:
+		if not (entry is Dictionary):
+			continue
+		var item: Dictionary = entry as Dictionary
+		signs.append(item["transform"])
+		sign_colors.append(item.get("tint", Color.WHITE))
+		sign_customs.append(item.get("custom", Color(0.0, 0.9, 0.0, 0.0)))
+
+	# Плиты и бордюры не отбрасывают тень: они лежат на земле, и тень от них
+	# невидима, зато инстансов у них сотни.
+	_emit_multimesh("Sidewalks", CityMaterials.box_mesh(), CityMaterials.concrete, slabs, [], [], false, SIDEWALK_VISIBLE_TO)
+	_emit_multimesh("Curbs", CityMaterials.box_mesh(), CityMaterials.concrete, curbs, [], [], false, SIDEWALK_VISIBLE_TO)
+	_emit_multimesh("RoadPaint", CityMaterials.box_mesh(), paint_material(), paint, [], [], false, PAINT_VISIBLE_TO)
+	_emit_multimesh("WalkMetal", CityMaterials.box_mesh(), CityMaterials.metal, metal, [], [], false, WALK_PROP_VISIBLE_TO)
+	_emit_multimesh("WalkPoles", CityMaterials.cylinder_mesh(), CityMaterials.metal, poles, [], [], false, WALK_PROP_VISIBLE_TO)
+	_emit_multimesh("WalkProps", CityMaterials.box_mesh(), CityMaterials.concrete, props, [], [], false, WALK_PROP_VISIBLE_TO)
+	_emit_multimesh("WalkSigns", CityMaterials.box_mesh(), CityMaterials.neon, signs, sign_colors, sign_customs, false, 0.0)
+
+	if near:
+		for xform: Transform3D in walk.get("boxes", []) as Array:
+			_detail_boxes.append({"transform": xform})
+		_emit_walk_lights(walk.get("lights", []) as Array)
+
+	_detail_stats["walk_items"] = NoirSidewalkBuilder.count(walk)
+	_detail_stats["walk_signs"] = signs.size()
+
+
+## Тёплый свет из витрин. Ровно пара источников на чанк: остальное делает
+## неоновый материал вывесок и отражения на мокром асфальте.
+func _emit_walk_lights(lights: Array) -> void:
+	var made: int = 0
+	for entry: Variant in lights:
+		if made >= MAX_WALK_LIGHTS:
+			return
+		if not (entry is Dictionary):
+			continue
+		var data: Dictionary = entry as Dictionary
+		var light := OmniLight3D.new()
+		light.name = "ShopLight_%d" % made
+		light.position = data.get("position", Vector3.ZERO)
+		light.light_color = data.get("color", Color(1.0, 0.75, 0.45))
+		light.light_energy = clampf(float(data.get("energy", 1.7)), 0.2, 6.0)
+		light.omni_range = clampf(float(data.get("range", 13.0)), 3.0, 40.0)
+		light.omni_attenuation = 1.5
+		light.shadow_enabled = false
+		light.distance_fade_enabled = true
+		light.distance_fade_begin = 55.0
+		light.distance_fade_length = 25.0
+		add_child(light)
+		_walk_lights.append(light)
+		made += 1
+
+
 # =========================================================== улицы
 
-## Наполнение улиц: бордюры, разметка, светофоры, урны, скамьи, киоски,
-## будки, машины и лужи. Только ближний LOD: всю эту мелочь видно только
-## с тротуара.
+## Наполнение улиц: светофоры, урны, скамьи, киоски, будки, машины и лужи.
+## Только ближний LOD: всю эту мелочь видно только с тротуара.
 func _build_streets() -> void:
 	var roads: Array = _content.get("roads", [])
 	if roads.is_empty():
