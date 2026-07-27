@@ -35,6 +35,10 @@ const HIDE_RING_DEFAULT := 1
 ## а потом выгружается: сам каркас остаётся, чтобы окна не стали дырами.
 const FURNITURE_SLEEP_RADIUS := 34.0
 const FURNITURE_UNLOAD_RADIUS := 48.0
+## Точность окклюзии. Больше лучей — агрессивнее отсечение.
+const OCCLUSION_RAYS_PER_THREAD := 32
+## Качество BVH окклюдеров: 0 = LOW, 1 = MEDIUM, 2 = HIGH.
+const OCCLUSION_BVH_QUALITY := 2
 
 signal chunk_built(coords: Vector2i, build_ms: int)
 signal chunk_released(coords: Vector2i)
@@ -141,16 +145,33 @@ func _configure_occlusion_culling() -> void:
 		Log.info("CityGenerator", "Occlusion Culling выключен вручную")
 		return
 
-	# Больше лучей — агрессивнее отсечение. 32 луча на поток дают заметный
-	# выигрыш на плотной застройке и практически не видны на CPU.
-	RenderingServer.occlusion_rays_per_thread = 32
-	if ProjectSettings.has_setting("rendering/occlusion_culling/bvh_build_quality"):
-		# 2 = HIGH. Перестройка BVH идёт при загрузке чанка, а не каждый кадр.
-		ProjectSettings.set_setting("rendering/occlusion_culling/bvh_build_quality", 2)
-	if ProjectSettings.has_setting("rendering/occlusion_culling/occlusion_rays_per_thread"):
-		ProjectSettings.set_setting("rendering/occlusion_culling/occlusion_rays_per_thread", 32)
+	# Точность окклюзии задаётся ТОЛЬКО настройками проекта: свойства
+	# `RenderingServer.occlusion_rays_per_thread` не существует, сервер сам
+	# перечитывает эти настройки. Пишем через guard, чтобы смена версии
+	# движка не уронила запуск.
+	_set_project_setting(
+		"rendering/occlusion_culling/occlusion_rays_per_thread",
+		OCCLUSION_RAYS_PER_THREAD
+	)
+	# HIGH: перестройка BVH идёт при загрузке чанка, а не каждый кадр.
+	_set_project_setting(
+		"rendering/occlusion_culling/bvh_build_quality",
+		OCCLUSION_BVH_QUALITY
+	)
 
-	Log.info("CityGenerator", "Occlusion Culling включён", {"лучей_на_поток": 32})
+	Log.info("CityGenerator", "Occlusion Culling включён", {
+		"лучей_на_поток": OCCLUSION_RAYS_PER_THREAD,
+		"качество_bvh": OCCLUSION_BVH_QUALITY,
+	})
+
+
+## Безопасная запись настройки проекта: незнакомый движку путь просто
+## игнорируется с предупреждением в лог.
+func _set_project_setting(path: String, value: Variant) -> void:
+	if not ProjectSettings.has_setting(path):
+		Log.warn("CityGenerator", "Настройка проекта не найдена", {"путь": path})
+		return
+	ProjectSettings.set_setting(path, value)
 
 
 func _process(delta: float) -> void:
