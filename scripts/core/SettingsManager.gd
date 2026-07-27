@@ -7,12 +7,10 @@ extends Node
 ## вся грязная работа: пресет -> десятки конкретных параметров рендера.
 ##
 ## Пресет жёстко перезаписывает ключи в `GameConfig`, а потом всё применяется
-## из одного места (`apply_all`). Потом игрок может крутить отдельные тумблеры —
-## тогда пресет становится «Пользовательские» только визуально, в файле остаётся
-## последний выбранный.
+## из одного места ([method apply_all]).
 ##
 ## Важно: Environment не ищется по дереву автоматически. Сцена сама зовёт
-## [method register_environment] — так менеджер не ломается в тестовых сценах без неба.
+## [method register_environment].
 
 const PRESETS: Array[String] = [
 	"Картошка",
@@ -32,9 +30,13 @@ const FSR_MODE_NAMES: Array[String] = [
 	"Нативное разрешение",
 ]
 
-## Масштаб рендера для режимов FSR. Нативный не 1.0, а ровно 1.0 —
-## сверхсемплинг задаётся отдельным ползунком resolution_scale.
+## Масштаб рендера для режимов FSR.
 const FSR_SCALES: Array[float] = [0.5, 0.67, 0.77, 1.0]
+
+## Потолок атласа теней. 16384 на многих видеокартах либо не создаётся
+## вовсе, либо съедает больше гигабайта видеопамяти — именно из-за этого
+## на «Экстремальных» и «Perfecto» тени ломались и мерцали.
+const SHADOW_ATLAS_MAX := 8192
 
 signal preset_applied(preset: String)
 signal fov_changed(fov: float)
@@ -52,6 +54,7 @@ const PRESET_TABLE: Dictionary = {
 		"render_distance_m": 220.0, "chunk_radius": 1, "npc_budget": 30,
 		"detail_density": 0.0, "cables": false, "steam": false, "debris": false,
 		"interior_furniture": false, "billboard_lights": 0, "hide_radius_chunks": 0,
+		"facade_detail": 0,
 	},
 	"Очень Низкие": {
 		"fsr_mode": 0, "fsr_sharpness": 0.25, "resolution_scale": 0.6,
@@ -61,6 +64,7 @@ const PRESET_TABLE: Dictionary = {
 		"render_distance_m": 320.0, "chunk_radius": 2, "npc_budget": 60,
 		"detail_density": 0.15, "cables": false, "steam": false, "debris": false,
 		"interior_furniture": true, "billboard_lights": 0, "hide_radius_chunks": 0,
+		"facade_detail": 1,
 	},
 	"Низкие": {
 		"fsr_mode": 1, "fsr_sharpness": 0.25, "resolution_scale": 0.7,
@@ -70,6 +74,7 @@ const PRESET_TABLE: Dictionary = {
 		"render_distance_m": 460.0, "chunk_radius": 3, "npc_budget": 100,
 		"detail_density": 0.35, "cables": true, "steam": false, "debris": true,
 		"interior_furniture": true, "billboard_lights": 1, "hide_radius_chunks": 1,
+		"facade_detail": 2,
 	},
 	"Средние": {
 		"fsr_mode": 2, "fsr_sharpness": 0.25, "resolution_scale": 0.85,
@@ -79,6 +84,7 @@ const PRESET_TABLE: Dictionary = {
 		"render_distance_m": 650.0, "chunk_radius": 4, "npc_budget": 150,
 		"detail_density": 0.55, "cables": true, "steam": true, "debris": true,
 		"interior_furniture": true, "billboard_lights": 1, "hide_radius_chunks": 1,
+		"facade_detail": 2,
 	},
 	"Высокие": {
 		"fsr_mode": 2, "fsr_sharpness": 0.25, "resolution_scale": 1.0,
@@ -88,6 +94,7 @@ const PRESET_TABLE: Dictionary = {
 		"render_distance_m": 900.0, "chunk_radius": 5, "npc_budget": 220,
 		"detail_density": 0.8, "cables": true, "steam": true, "debris": true,
 		"interior_furniture": true, "billboard_lights": 2, "hide_radius_chunks": 1,
+		"facade_detail": 3,
 	},
 	"Ультра": {
 		"fsr_mode": 3, "fsr_sharpness": 0.2, "resolution_scale": 1.0,
@@ -97,6 +104,7 @@ const PRESET_TABLE: Dictionary = {
 		"render_distance_m": 1100.0, "chunk_radius": 6, "npc_budget": 300,
 		"detail_density": 1.0, "cables": true, "steam": true, "debris": true,
 		"interior_furniture": true, "billboard_lights": 3, "hide_radius_chunks": 2,
+		"facade_detail": 4,
 	},
 	"Экстремальные": {
 		"fsr_mode": 3, "fsr_sharpness": 0.15, "resolution_scale": 1.15,
@@ -106,15 +114,17 @@ const PRESET_TABLE: Dictionary = {
 		"render_distance_m": 1400.0, "chunk_radius": 7, "npc_budget": 380,
 		"detail_density": 1.25, "cables": true, "steam": true, "debris": true,
 		"interior_furniture": true, "billboard_lights": 4, "hide_radius_chunks": 2,
+		"facade_detail": 4,
 	},
 	"Perfecto": {
 		"fsr_mode": 3, "fsr_sharpness": 0.1, "resolution_scale": 1.35,
-		"shadow_atlas": 16384, "sdfgi": true, "ssr": true, "ssao": true, "ssil": true,
+		"shadow_atlas": 8192, "sdfgi": true, "ssr": true, "ssao": true, "ssil": true,
 		"volumetric_fog": true, "glow": true, "msaa": 3, "taa": true, "debanding": true,
 		"anisotropy": 3, "texture_quality": 3,
 		"render_distance_m": 1800.0, "chunk_radius": 8, "npc_budget": 460,
 		"detail_density": 1.5, "cables": true, "steam": true, "debris": true,
 		"interior_furniture": true, "billboard_lights": 6, "hide_radius_chunks": 3,
+		"facade_detail": 4,
 	},
 }
 
@@ -139,8 +149,8 @@ func preset_names() -> Array[String]:
 
 
 func current_preset() -> String:
-	var name: String = GameConfig.get_string("graphics", "preset")
-	return name if PRESETS.has(name) else "Высокие"
+	var preset_name: String = GameConfig.get_string("graphics", "preset")
+	return preset_name if PRESETS.has(preset_name) else "Высокие"
 
 
 func preset_index() -> int:
@@ -197,8 +207,7 @@ func _apply_window() -> void:
 	Engine.max_fps = maxi(0, GameConfig.get_int("graphics", "fps_limit"))
 
 
-## FSR и масштабирование. Итоговый масштаб = режим FSR × ползунок игрока,
-## потому что «Качество + 0.8» — осмысленная комбинация на слабом железе.
+## FSR и масштабирование. Итоговый масштаб = режим FSR × ползунок игрока.
 func _apply_viewport() -> void:
 	var viewport: Viewport = get_viewport()
 	if viewport == null:
@@ -209,9 +218,10 @@ func _apply_viewport() -> void:
 	var user_scale: float = clampf(GameConfig.get_float("graphics", "resolution_scale"), 0.25, 2.0)
 	var scale: float = clampf(FSR_SCALES[mode] * user_scale, 0.25, 2.0)
 
-	if mode >= 3 and is_equal_approx(user_scale, 1.0):
-		# Натив без сверхсемплинга: FSR выключаем совсем, иначе платим
-		# за апскейлер при отсутствии выгоды.
+	if scale >= 1.0:
+		# Натив и сверхсемплинг: FSR2 выключаем. Апскейлер при масштабе > 1
+		# только вредит: платим за пересборку кадра и получаем артефакты
+		# на тонких деталях и кромках теней.
 		viewport.scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
 	else:
 		viewport.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR2
@@ -221,29 +231,100 @@ func _apply_viewport() -> void:
 	viewport.msaa_3d = clampi(GameConfig.get_int("graphics", "msaa"), 0, 3) as Viewport.MSAA
 	viewport.use_taa = GameConfig.get_bool("graphics", "taa")
 	viewport.use_debanding = GameConfig.get_bool("graphics", "debanding")
-	# FXAA включаем только там, где нет ни MSAA, ни TAA: три сглаживания сразу
-	# дают кашу из пикселей без выигрыша в качестве.
+	# FXAA включаем только там, где нет ни MSAA, ни TAA.
 	var want_fxaa: bool = viewport.msaa_3d == Viewport.MSAA_DISABLED and not viewport.use_taa
 	viewport.screen_space_aa = Viewport.SCREEN_SPACE_AA_FXAA if want_fxaa else Viewport.SCREEN_SPACE_AA_DISABLED
 
 
+## Тени. Здесь живут три исправления багов верхних пресетов:
+## 1. атлас ограничен 8192 — 16384 многие гпу просто не выдают;
+## 2. 16-битная точность теперь только на малых атласах (было наоборот,
+##    из-за этого на «Perfecto» тени рябили и полосили);
+## 3. биасы, сплиты и дальность теней задаются явно под каждый пресет.
 func _apply_shadows() -> void:
-	var atlas: int = maxi(0, GameConfig.get_int("graphics", "shadow_atlas"))
+	var requested: int = maxi(0, GameConfig.get_int("graphics", "shadow_atlas"))
 	var viewport: Viewport = get_viewport()
 
-	if atlas <= 0:
+	if requested <= 0:
 		# Полное отключение теней (режим «Картошка»).
 		if viewport != null:
 			viewport.positional_shadow_atlas_size = 256
 		RenderingServer.directional_shadow_atlas_set_size(256, false)
 		_set_sun_shadow(false)
+		_apply_shadow_filters(0)
 		return
 
+	var atlas: int = clampi(requested, 512, SHADOW_ATLAS_MAX)
+	if atlas != requested:
+		Log.debug("Settings", "Атлас теней ограничен потолком", {"запрошено": requested, "применено": atlas})
+
+	var low_precision: bool = atlas <= 2048
 	if viewport != null:
 		viewport.positional_shadow_atlas_size = atlas
-		viewport.positional_shadow_atlas_16_bits = atlas <= 2048
-	RenderingServer.directional_shadow_atlas_set_size(atlas, atlas >= 4096)
+		viewport.positional_shadow_atlas_16_bits = low_precision
+		# Квадранты атласа: город — это много мелких омни-ламп, а не
+		# несколько огромных, поэтому дробим помельче.
+		viewport.positional_shadow_atlas_quad_0 = Viewport.SHADOW_ATLAS_QUADRANT_SUBDIV_4
+		viewport.positional_shadow_atlas_quad_1 = Viewport.SHADOW_ATLAS_QUADRANT_SUBDIV_16
+		viewport.positional_shadow_atlas_quad_2 = Viewport.SHADOW_ATLAS_QUADRANT_SUBDIV_16
+		viewport.positional_shadow_atlas_quad_3 = Viewport.SHADOW_ATLAS_QUADRANT_SUBDIV_64
+
+	RenderingServer.directional_shadow_atlas_set_size(atlas, low_precision)
 	_set_sun_shadow(true)
+	_apply_shadow_filters(atlas)
+	_apply_sun_shadow_tuning(atlas)
+
+
+## Качество фильтра мягких теней. На верхних пресетах без этого большой
+## атлас давал резкий шум по кромкам вместо плавной тени.
+func _apply_shadow_filters(atlas: int) -> void:
+	var quality: int = RenderingServer.SHADOW_QUALITY_HARD
+	if atlas >= 8192:
+		quality = RenderingServer.SHADOW_QUALITY_SOFT_ULTRA
+	elif atlas >= 4096:
+		quality = RenderingServer.SHADOW_QUALITY_SOFT_HIGH
+	elif atlas >= 2048:
+		quality = RenderingServer.SHADOW_QUALITY_SOFT_MEDIUM
+	elif atlas > 0:
+		quality = RenderingServer.SHADOW_QUALITY_SOFT_LOW
+
+	if RenderingServer.has_method("directional_soft_shadow_filter_set_quality"):
+		RenderingServer.directional_soft_shadow_filter_set_quality(quality)
+	if RenderingServer.has_method("positional_soft_shadow_filter_set_quality"):
+		RenderingServer.positional_soft_shadow_filter_set_quality(quality)
+
+
+## Настройка самого солнца/луны. Город из сотен высотных боксов — самый
+## тяжёлый случай для PSSM: без явных сплитов и биасов на дальних
+## каскадах тень отрывается от основания здания или полосит.
+func _apply_sun_shadow_tuning(atlas: int) -> void:
+	if _sun == null or not is_instance_valid(_sun):
+		return
+
+	var render_distance: float = clampf(GameConfig.get_float("graphics", "render_distance_m"), 200.0, 2000.0)
+	# Дальность теней не равна дальности отрисовки: растянутый на километр
+	# каскад — гарантированная гребёнка на ближних объектах.
+	var shadow_distance: float = clampf(render_distance * 0.35, 180.0, 420.0)
+
+	_sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
+	_sun.directional_shadow_max_distance = shadow_distance
+	_sun.directional_shadow_split_1 = 0.06
+	_sun.directional_shadow_split_2 = 0.16
+	_sun.directional_shadow_split_3 = 0.42
+	_sun.directional_shadow_blend_splits = true
+	_sun.directional_shadow_fade_start = 0.85
+	# Размер pancake: высотные здания требуют большого запаса по высоте,
+	# иначе тени от вершин обрезаются и мигают при повороте камеры.
+	_sun.directional_shadow_pancake_size = 120.0
+
+	# Биас масштабируем обратно разрешению атласа: чем больше атлас,
+	# тем мельче тексель и тем меньше нужно смещение.
+	var texel_scale: float = clampf(4096.0 / float(maxi(512, atlas)), 0.4, 4.0)
+	_sun.shadow_bias = clampf(0.045 * texel_scale, 0.012, 0.16)
+	_sun.shadow_normal_bias = clampf(1.4 * texel_scale, 0.6, 4.0)
+	_sun.shadow_transmittance_bias = 0.05
+	_sun.shadow_opacity = 1.0
+	_sun.shadow_blur = clampf(0.9 * texel_scale, 0.5, 1.6)
 
 
 func _set_sun_shadow(enabled: bool) -> void:
@@ -257,11 +338,10 @@ func _apply_textures() -> void:
 		ProjectSettings.set_setting("rendering/textures/default_filters/anisotropic_filtering_level", aniso)
 
 	# Масштаб текстур в нашей игре — это разрешение процедурного атласа
-	# фасадов; его пересборка требует перезапуска сцены, поэтому здесь только
-	# сохраняем значение — CityMaterials читает его при старте.
+	# фасадов; его пересборка требует перезапуска сцены.
 
 
-## Подключает Environment сцены. Одновременно применяет к нему текущие настройки.
+## Подключает Environment сцены. Одновременно применяет к нему настройки.
 func register_environment(env: Environment, sun: DirectionalLight3D = null) -> void:
 	if env == null:
 		Log.warn("Settings", "register_environment получил null")
@@ -280,20 +360,24 @@ func _apply_environment() -> void:
 
 	var env: Environment = _environment
 	var preset: String = current_preset()
+	var heavy: bool = preset in ["Ультра", "Экстремальные", "Perfecto"]
 
 	# Глобальное освещение.
 	env.sdfgi_enabled = GameConfig.get_bool("graphics", "sdfgi")
 	if env.sdfgi_enabled:
-		var heavy: bool = preset in ["Ультра", "Экстремальные", "Perfecto"]
 		env.sdfgi_cascades = 6 if heavy else 4
 		env.sdfgi_use_occlusion = heavy
 		env.sdfgi_energy = 1.15 if preset == "Perfecto" else 1.0
 		env.sdfgi_y_scale = Environment.SDFGI_Y_SCALE_75_PERCENT
+		# Без отступа пробы SDFGI цепляют стены и дают тёмные пятна
+		# рядом с тенями небоскрёбов.
+		env.sdfgi_normal_bias = 1.1
+		env.sdfgi_probe_bias = 1.1
 
 	# Отражения в экранном пространстве — главный источник нуара на мокром асфальте.
 	env.ssr_enabled = GameConfig.get_bool("graphics", "ssr")
 	if env.ssr_enabled:
-		env.ssr_max_steps = 128 if preset == "Perfecto" else (64 if preset in ["Ультра", "Экстремальные"] else 32)
+		env.ssr_max_steps = 128 if preset == "Perfecto" else (64 if heavy else 32)
 		env.ssr_fade_in = 0.15
 		env.ssr_fade_out = 2.0
 		env.ssr_depth_tolerance = 0.2
@@ -306,21 +390,19 @@ func _apply_environment() -> void:
 	env.ssil_enabled = GameConfig.get_bool("graphics", "ssil")
 
 	# Объёмный туман: свет от неонки в дождевом воздухе.
+	# Плотность днём пересчитывает NoirSkyController — здесь только потолки.
 	env.volumetric_fog_enabled = GameConfig.get_bool("graphics", "volumetric_fog")
 	if env.volumetric_fog_enabled:
-		var dense: bool = preset in ["Экстремальные", "Perfecto"]
-		env.volumetric_fog_density = 0.035 if dense else 0.022
-		env.volumetric_fog_length = 96.0 if dense else 64.0
+		env.volumetric_fog_length = 96.0 if heavy else 64.0
 		env.volumetric_fog_detail_spread = 2.0
 		env.volumetric_fog_gi_inject = 1.0 if env.sdfgi_enabled else 0.0
 		env.volumetric_fog_albedo = Color(0.62, 0.66, 0.74)
 
 	env.glow_enabled = GameConfig.get_bool("graphics", "glow")
 	if env.glow_enabled:
-		env.glow_intensity = 0.9
-		env.glow_bloom = 0.18
+		env.glow_intensity = 0.75
 		env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
-		env.glow_hdr_threshold = 0.85
+		# Порог и bloom докручивает NoirSkyController по времени суток.
 
 	quality_reapplied.emit()
 
@@ -335,8 +417,6 @@ func _apply_ui_scale() -> void:
 
 ## Пробрасывает пресет в материалы города (сила неона, блики, сканлайны).
 func _apply_materials() -> void:
-	if not Engine.has_singleton("CityMaterials") and CityMaterials == null:
-		return
 	if CityMaterials == null or not CityMaterials.has_method("apply_quality"):
 		return
 	CityMaterials.apply_quality(current_preset())
@@ -413,7 +493,7 @@ func _on_setting_changed(section: String, key: String, value: Variant) -> void:
 			_apply_window()
 		"fsr_mode", "fsr_sharpness", "resolution_scale", "msaa", "taa", "debanding":
 			_apply_viewport()
-		"shadow_atlas":
+		"shadow_atlas", "render_distance_m":
 			_apply_shadows()
 		"anisotropy", "texture_quality":
 			_apply_textures()
