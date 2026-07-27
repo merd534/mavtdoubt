@@ -1,0 +1,119 @@
+[gd_scene load_steps=7 format=3]
+
+[ext_resource type="Script" path="res://scripts/dev/Phase3DetailBench.gd" id="1_bench"]
+[ext_resource type="Script" path="res://scripts/city/CityGenerator.gd" id="2_city"]
+[ext_resource type="Script" path="res://scripts/dev/DevFlyCamera.gd" id="3_player"]
+[ext_resource type="PackedScene" path="res://scenes/ui/SettingsMenu.tscn" id="4_menu"]
+
+[sub_resource type="Environment" id="Environment_detail"]
+background_mode = 1
+background_color = Color(0.0392157, 0.0470588, 0.0705882, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.0627451, 0.0862745, 0.133333, 1)
+ambient_light_energy = 0.5
+tonemap_mode = 3
+tonemap_exposure = 1.35
+tonemap_white = 4.0
+ssr_enabled = true
+ssr_max_steps = 64
+ssr_fade_in = 0.15
+ssr_fade_out = 8.0
+ssr_depth_tolerance = 0.25
+ssao_enabled = true
+ssao_radius = 1.4
+ssao_intensity = 2.0
+ssao_detail = 0.6
+sdfgi_enabled = true
+sdfgi_use_occlusion = true
+sdfgi_cascades = 4
+sdfgi_min_cell_size = 0.4
+sdfgi_energy = 1.0
+glow_enabled = true
+glow_intensity = 0.9
+glow_strength = 1.0
+glow_bloom = 0.18
+glow_blend_mode = 1
+glow_hdr_threshold = 0.85
+glow_hdr_scale = 2.0
+fog_enabled = true
+fog_light_color = Color(0.0588235, 0.0784314, 0.121569, 1)
+fog_light_energy = 0.8
+fog_sun_scatter = 0.05
+fog_density = 0.00035
+fog_aerial_perspective = 0.15
+fog_sky_affect = 0.3
+volumetric_fog_enabled = true
+volumetric_fog_density = 0.022
+volumetric_fog_albedo = Color(0.0784314, 0.101961, 0.152941, 1)
+volumetric_fog_emission = Color(0.0313726, 0.0431373, 0.0705882, 1)
+volumetric_fog_emission_energy = 0.35
+volumetric_fog_length = 96.0
+volumetric_fog_detail_spread = 2.0
+volumetric_fog_ambient_inject = 0.6
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_hud"]
+bg_color = Color(0.0156863, 0.0196078, 0.0313726, 0.784314)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+border_color = Color(0.0196078, 0.850980, 0.909804, 0.392157)
+corner_radius_top_left = 3
+corner_radius_top_right = 3
+corner_radius_bottom_right = 3
+corner_radius_bottom_left = 3
+content_margin_left = 12.0
+content_margin_top = 9.0
+content_margin_right = 12.0
+content_margin_bottom = 9.0
+
+[node name="Phase3DetailBench" type="Node3D"]
+script = ExtResource("1_bench")
+start_position = Vector3(-120, 24, 260)
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_detail")
+
+[node name="MoonLight" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.866, 0, -0.5, -0.354, 0.707, -0.612, 0.354, 0.707, 0.612, 0, 200, 0)
+light_color = Color(0.415686, 0.501961, 0.729412, 1)
+light_energy = 0.09
+light_specular = 0.2
+shadow_enabled = true
+directional_shadow_mode = 2
+directional_shadow_split_1 = 0.06
+directional_shadow_split_2 = 0.18
+directional_shadow_split_3 = 0.45
+directional_shadow_blend_splits = true
+directional_shadow_max_distance = 260.0
+
+[node name="CityGenerator" type="Node3D" parent="."]
+script = ExtResource("2_city")
+chunk_size = 240.0
+build_budget_ms = 6.0
+auto_stream = true
+max_builds_per_frame = 2
+max_releases_per_frame = 3
+use_occlusion_culling = true
+
+[node name="Player" type="CharacterBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -120, 24, 260)
+collision_layer = 2
+collision_mask = 1
+script = ExtResource("3_player")
+flying = true
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="Stats" type="RichTextLabel" parent="UI"]
+anchors_preset = 0
+offset_left = 18.0
+offset_top = 16.0
+offset_right = 760.0
+offset_bottom = 220.0
+bbcode_enabled = true
+fit_content = true
+scroll_active = false
+theme_override_styles/normal = SubResource("StyleBoxFlat_hud")
+
+[node name="SettingsMenu" parent="." instance=ExtResource("4_menu")]
