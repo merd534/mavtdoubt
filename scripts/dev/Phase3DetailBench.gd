@@ -1,14 +1,13 @@
 class_name NoirPhase3DetailBench
 extends Node3D
-## Игровая сцена фаз 3-6: детализация зданий, стриминг, окклюзия,
-## графические пресеты и время суток.
+## Игровая сцена фаз 3-6: детализация зданий, наполнение улиц, стриминг,
+## окклюзия, графические пресеты и время суток.
 ##
 ## Управление: WASD — движение, мышь — обзор, Esc — пауза и настройки.
-## Горячие клавиши F1-F7 удалены: всё, что они делали (пресеты, сложность,
-## окклюзия, время), теперь живёт в меню настроек.
+## Горячие клавиши F1-F7 удалены: всё, что они делали, живёт в меню настроек.
 ##
-## Свет и небо пересчитываются по часам мира, поэтому ползунок времени
-## в настройках сразу меняет картинку: глухая ночь, рассвет, день, закат.
+## Свет, небо и туман считает [NoirSkyController]: сцена только сообщает ему
+## текущее время и настройки раздела «Мир».
 
 const HUD_INTERVAL := 0.25
 const PAUSE_MENU_SCENE := "res://scenes/ui/PauseMenu.tscn"
@@ -65,6 +64,9 @@ func _ready() -> void:
 	_generator.chunk_built.connect(_on_chunk_built)
 	_generator.interior_opened.connect(_on_interior_opened)
 	Settings.preset_applied.connect(_on_preset_applied)
+	# Пресет может выключить туман или bloom — после этого надо заново
+	# разложить время суток по оставшимся параметрам.
+	Settings.quality_reapplied.connect(_apply_world_look)
 	Difficulty.difficulty_applied.connect(_on_difficulty_applied)
 
 	if WorldClock != null:
@@ -114,42 +116,31 @@ func _process(delta: float) -> void:
 
 # ------------------------------------------------------------- свет и время
 
-## Перестраивает солнце/луну и экспозицию под текущее время суток
-## и настройки раздела «Мир». Все обращения проверены на null: сцена может
-## быть без солнца или без Environment.
+## Всю грязную работу делает [NoirSkyController]; сцена только собирает
+## входные числа. Подпись без аргументов — подходит и для сигналов.
 func _apply_world_look() -> void:
 	if WorldClock == null:
 		return
+	if _world_env == null or _world_env.environment == null:
+		return
 
-	var daylight: float = WorldClock.daylight()
 	var exposure: float = 1.0
 	var night_boost: float = 1.0
 	if GameConfig != null:
-		exposure = clampf(GameConfig.get_float("world", "exposure"), 0.2, 3.0)
-		night_boost = clampf(GameConfig.get_float("world", "night_brightness"), 0.3, 4.0)
+		exposure = GameConfig.get_float("world", "exposure")
+		night_boost = GameConfig.get_float("world", "night_brightness")
 
-	if _sun != null and is_instance_valid(_sun):
-		# Светило идёт по дуге: в 03:00 под горизонтом, в 15:00 в зените.
-		var elevation: float = WorldClock.sun_elevation_deg()
-		var azimuth: float = -35.0 + 180.0 * (float(WorldClock.minutes_of_day()) / float(NoirWorldClock.MINUTES_PER_DAY))
-		_sun.rotation_degrees = Vector3(-clampf(elevation, -80.0, 80.0), azimuth, 0.0)
-
-		# Ночью оставляем тусклый лунный свет, днём — полноценное солнце.
-		var night_energy: float = _base_sun_energy * night_boost
-		var day_energy: float = maxf(_base_sun_energy, 0.8) * 3.4
-		_sun.light_energy = lerpf(night_energy, day_energy, daylight)
-		_sun.light_color = Color(0.62, 0.72, 1.0).lerp(Color(1.0, 0.94, 0.84), daylight)
-
-	if _world_env != null and _world_env.environment != null:
-		var env: Environment = _world_env.environment
-		env.tonemap_exposure = exposure * lerpf(1.0, 1.15, daylight)
-		env.ambient_light_energy = maxf(0.02, _base_ambient_energy * lerpf(night_boost, 2.2, daylight))
-		env.background_energy_multiplier = lerpf(0.55 * night_boost, 1.6, daylight)
-		# Ночной подъём теней — через adjustment_brightness, чтобы игрок мог
-		# видеть геометрию в переулках, а не чёрную кашу.
-		var brightness: float = lerpf(night_boost, 1.0, daylight)
-		env.adjustment_enabled = not is_equal_approx(brightness, 1.0)
-		env.adjustment_brightness = brightness
+	NoirSkyController.apply(
+		_world_env.environment,
+		_sun,
+		WorldClock.minutes_of_day(),
+		WorldClock.daylight(),
+		WorldClock.sun_elevation_deg(),
+		exposure,
+		night_boost,
+		_base_sun_energy,
+		_base_ambient_energy
+	)
 
 
 func _on_minute_changed(_minutes_of_day: int) -> void:
