@@ -1,11 +1,21 @@
 class_name NoirCityChunk
 extends Node3D
-## Один чанк города. Превращает данные `NoirBuildingFactory` в узлы сцены.
+## Один чанк города. Превращает данные `NoirBuildingFactory` и `NoirBuildingDetailer`
+## в узлы сцены.
 ##
-## Бюджет вызовов отрисовки на чанк держится в районе 6-8 независимо от того,
-## сколько в нём зданий: всё однотипное сливается в MultiMesh.
+## Бюджет вызовов отрисовки на чанк держится в районе 15-18 независимо от того,
+## сколько в нём зданий и деталей: всё однотипное сливается в MultiMesh.
 ##
 ##   Buildings   — MultiMesh, куб + facade.gdshader        (1 вызов)
+##   Massing     — MultiMesh, куб + facade (ФАЗА 3)         (1 вызов)
+##   Trims       — MultiMesh, куб + бетон (ФАЗА 3)         (1 вызов)
+##   Niches      — MultiMesh, квад + стекло (ФАЗА 3)       (1 вызов)
+##   Fixtures    — MultiMesh, куб + ржавый металл (ФАЗА 3)  (1 вызов)
+##   Pipes       — MultiMesh, цилиндр + металл (ФАЗА 3)     (1 вызов)
+##   Cables      — MultiMesh, куб + кабель (ФАЗА 3)         (1 вызов)
+##   Ladders     — MultiMesh, куб + ржавый металл (ФАЗА 3)  (1 вызов)
+##   Billboards  — MultiMesh, куб + неон (ФАЗА 3)           (1 вызов)
+##   Holograms   — MultiMesh, квад + hologram (ФАЗА 3)      (1 вызов)
 ##   Signs       — MultiMesh, квад + neon.gdshader         (1 вызов)
 ##   Props       — MultiMesh, куб + бетон                  (1 вызов)
 ##   LampPosts   — MultiMesh, цилиндр + металл             (1 вызов)
@@ -14,17 +24,27 @@ extends Node3D
 ##   Occluder    — ArrayOccluder3D, геометрия не рисуется  (0 вызовов)
 ##
 ## Уровни детализации:
-##   0 — вблизи: реквизит, коллизии, настоящие источники света, входы
-##   1 — средне: здания, вывески, фонарные столбы, коллизии
+##   0 — вблизи: вся архитектурная детализация, подворотни, частицы,
+##       зоны лазания, реквизит, коллизии, настоящие источники света, входы
+##   1 — средне: здания, объём и карнизы, вывески, столбы, коллизии
 ##   2 — далеко: только здания и полотно дорог
+##
+## ФАЗА 4 добавила [method set_hidden]: чанк может полностью уйти из
+## отрисовки и физики, не разбирая собранную геометрию — это дешевле
+## пересборки, когда игрок ходит туда-сюда через границу радиуса.
 
 const DETAIL_NEAR := 0
 const DETAIL_MID := 1
 const DETAIL_FAR := 2
 
-const MAX_REAL_LIGHTS := 6            ## живых OmniLight3D на ближний чанк
+const MAX_REAL_LIGHTS := 6            ## живых OmniLight3D от фонарей на ближний чанк
+const MAX_DETAIL_LIGHTS := 8          ## живых источников от неона и подворотен
+const MAX_PARTICLE_SYSTEMS := 10      ## GPU-эмиттеров на чанк
+const MAX_CLIMB_ZONES := 12
 const PROP_VISIBLE_TO := 240.0
 const LAMP_POST_VISIBLE_TO := 420.0   ## столбы прячем далеко, светящиеся головы — нет
+const TRIM_VISIBLE_TO := 190.0        ## мелкий декор фасада
+const SMALL_DETAIL_VISIBLE_TO := 120.0 ## кабели, щитки, мусор
 
 var coords: Vector2i = Vector2i.ZERO
 var rect: Rect2 = Rect2()
@@ -32,7 +52,10 @@ var detail_level: int = DETAIL_FAR
 
 var _content: Dictionary = {}
 var _built: bool = false
+var _hidden: bool = false
 var _build_msec: int = 0
+var _city_seed: int = 0
+var _detail_stats: Dictionary = {}
 
 var _buildings_mm: MultiMeshInstance3D = null
 var _signs_mm: MultiMeshInstance3D = null
@@ -44,6 +67,14 @@ var _arterial_mesh: MeshInstance3D = null
 var _occluder: OccluderInstance3D = null
 var _body: StaticBody3D = null
 var _lights: Array[OmniLight3D] = []
+
+# --- ФАЗА 3 ---
+var _detail_nodes: Array[MultiMeshInstance3D] = []
+var _detail_lights: Array[OmniLight3D] = []
+var _particles: Array[GPUParticles3D] = []
+var _climb_areas: Array[NoirClimbArea] = []
+var _detail_boxes: Array[Dictionary] = []   ## боксы для коллизий деталей
+var _detail_occluders: Array[Dictionary] = []
 
 
 static func create(chunk_coords: Vector2i, chunk_rect: Rect2, detail: int) -> NoirCityChunk:
@@ -59,6 +90,7 @@ static func create(chunk_coords: Vector2i, chunk_rect: Rect2, detail: int) -> No
 ## Строит содержимое. Возвращает время сборки в миллисекундах.
 func build(city_seed: int) -> int:
 	var started: int = Time.get_ticks_usec()
+	_city_seed = city_seed
 
 	_content = NoirBuildingFactory.generate(rect, city_seed, detail_level)
 
@@ -68,6 +100,9 @@ func build(city_seed: int) -> int:
 	# зато без них дальний план становится чёрным полем вместо неонового ковра.
 	_build_signs()
 	_build_lamps()
+	# ФАЗА 3: объёмная архитектура. Строится до окклюдера, чтобы крупные
+	# добавленные массы тоже перекрывали видимость.
+	_build_details()
 	if detail_level == DETAIL_NEAR:
 		_build_props()
 		_build_collision()
@@ -87,11 +122,58 @@ func set_detail(level: int, city_seed: int) -> bool:
 	detail_level = target
 	_clear_nodes()
 	build(city_seed)
+	if _hidden:
+		# Скрытое состояние переживает пересборку: иначе далёкий чанк снова
+		# окажется видимым после смены LOD.
+		_apply_hidden(true)
 	return true
 
 
 func is_built() -> bool:
 	return _built
+
+
+func is_hidden_chunk() -> bool:
+	return _hidden
+
+
+## ФАЗА 4. Полное скрытие чанка без разборки геометрии: снимает чанк с
+## отрисовки, глушит частицы, свет и физику.
+func set_hidden(hide: bool) -> void:
+	if _hidden == hide:
+		return
+	_hidden = hide
+	_apply_hidden(hide)
+
+
+func _apply_hidden(hide: bool) -> void:
+	visible = not hide
+
+	for emitter: GPUParticles3D in _particles:
+		if is_instance_valid(emitter):
+			emitter.emitting = not hide
+			emitter.visible = not hide
+
+	for light: OmniLight3D in _lights:
+		if is_instance_valid(light):
+			light.visible = not hide
+	for light: OmniLight3D in _detail_lights:
+		if is_instance_valid(light):
+			light.visible = not hide
+
+	# Скрытые чанки всегда дальше игрока, чем радиус физики, поэтому их
+	# тела безопасно выключить из широкой фазы.
+	if _body != null and is_instance_valid(_body):
+		_body.collision_layer = 0 if hide else 1
+	for area: NoirClimbArea in _climb_areas:
+		if is_instance_valid(area):
+			area.monitoring = not hide
+
+	if _occluder != null and is_instance_valid(_occluder):
+		# Невидимый чанк не должен перекрывать видимость того, что за ним.
+		_occluder.visible = not hide
+
+	Log.trace("CityChunk", "Смена видимости чанка", {"чанк": str(coords), "скрыт": hide})
 
 
 func entrances() -> Array:
@@ -104,23 +186,34 @@ func building_count() -> int:
 	return (raw as Array).size() if raw is Array else 0
 
 
+func climb_zones() -> Array[NoirClimbArea]:
+	return _climb_areas.duplicate()
+
+
 func stats() -> Dictionary:
-	return {
+	var out: Dictionary = {
 		"coords": coords,
 		"detail": detail_level,
+		"hidden": _hidden,
 		"build_ms": _build_msec,
 		"buildings": building_count(),
 		"signs": _count("signs"),
 		"props": _count("props"),
 		"lamps": _count("lamps"),
-		"lights": _lights.size(),
-		"occluders": _count("occluders"),
+		"lights": _lights.size() + _detail_lights.size(),
+		"particles": _particles.size(),
+		"climb_zones": _climb_areas.size(),
+		"occluders": _count("occluders") + _detail_occluders.size(),
 	}
+	for key: Variant in _detail_stats.keys():
+		out[str(key)] = _detail_stats[key]
+	return out
 
 
 func dispose() -> void:
 	_clear_nodes()
 	_content.clear()
+	_detail_stats.clear()
 	_built = false
 	queue_free()
 
@@ -131,8 +224,18 @@ func _count(key: String) -> int:
 
 
 func _clear_nodes() -> void:
+	# Зоны лазания снимают состояние с тел в _exit_tree, но отключаем
+	# мониторинг заранее, чтобы не прилетело лишних сигналов при выгрузке.
+	for area: NoirClimbArea in _climb_areas:
+		if is_instance_valid(area):
+			area.monitoring = false
+	for emitter: GPUParticles3D in _particles:
+		if is_instance_valid(emitter):
+			emitter.emitting = false
+
 	for child: Node in get_children():
 		child.queue_free()
+
 	_buildings_mm = null
 	_signs_mm = null
 	_props_mm = null
@@ -143,6 +246,12 @@ func _clear_nodes() -> void:
 	_occluder = null
 	_body = null
 	_lights.clear()
+	_detail_nodes.clear()
+	_detail_lights.clear()
+	_particles.clear()
+	_climb_areas.clear()
+	_detail_boxes.clear()
+	_detail_occluders.clear()
 
 
 # ---------------------------------------------------------------- здания
@@ -176,6 +285,312 @@ func _build_buildings() -> void:
 		else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	)
 	add_child(_buildings_mm)
+
+
+# =========================================================== ФАЗА 3: детали
+
+## Бюджет детализации из настроек. Читаем секцию целиком и берём ключи с
+## дефолтами: так чанк работает даже если конфиг старой версии.
+func _detail_budget() -> Dictionary:
+	var cfg: Dictionary = NoirBuildingDetailer.budget_defaults()
+	cfg["level"] = detail_level
+
+	var graphics: Dictionary = GameConfig.section("graphics")
+	if graphics.is_empty():
+		return cfg
+
+	cfg["density"] = clampf(float(graphics.get("detail_density", cfg["density"])), 0.0, 1.0)
+	cfg["cables"] = bool(graphics.get("cables", cfg["cables"]))
+	cfg["steam"] = bool(graphics.get("steam", cfg["steam"]))
+	cfg["debris"] = bool(graphics.get("debris", cfg["debris"]))
+	cfg["drips"] = bool(graphics.get("steam", cfg["drips"]))
+	cfg["billboard_lights"] = maxi(0, int(graphics.get("billboard_lights", cfg["billboard_lights"])))
+	# На самых низких пресетах ниши и голограммы гасятся плотностью.
+	var density: float = float(cfg["density"])
+	cfg["niches"] = density > 0.25
+	cfg["holograms"] = density > 0.15
+	cfg["max_elements"] = maxi(24, int(round(float(NoirBuildingDetailer.MAX_ELEMENTS) * clampf(0.3 + density, 0.3, 1.0))))
+	return cfg
+
+
+func _build_details() -> void:
+	var buildings: Array = _content.get("buildings", [])
+	if buildings.is_empty() or detail_level >= DETAIL_FAR:
+		return
+
+	var budget: Dictionary = _detail_budget()
+	if float(budget.get("density", 0.0)) <= 0.01:
+		return
+
+	var masses: Array[Transform3D] = []
+	var mass_colors: Array[Color] = []
+	var mass_customs: Array[Color] = []
+	var trims: Array[Transform3D] = []
+	var niches: Array[Transform3D] = []
+	var niche_colors: Array[Color] = []
+	var niche_customs: Array[Color] = []
+	var fixtures: Array[Transform3D] = []
+	var pipes: Array[Transform3D] = []
+	var cables: Array[Transform3D] = []
+	var ladders: Array[Transform3D] = []
+	var billboards: Array[Transform3D] = []
+	var billboard_colors: Array[Color] = []
+	var billboard_customs: Array[Color] = []
+	var holograms: Array[Transform3D] = []
+	var holo_colors: Array[Color] = []
+	var holo_customs: Array[Color] = []
+	var drips: Array[Vector3] = []
+	var lights: Array[Dictionary] = []
+	var climb: Array[Dictionary] = []
+
+	for entry: Variant in buildings:
+		if not (entry is Dictionary):
+			continue
+		var b: Dictionary = entry as Dictionary
+		var district: Variant = CityAtlas.get_district(str(b.get("district", "")))
+		var result: Dictionary = NoirBuildingDetailer.detail(b, district, budget)
+		if result.is_empty():
+			continue
+
+		for item: Variant in result.get("masses", []) as Array:
+			var mass: Dictionary = item as Dictionary
+			masses.append(mass["transform"])
+			mass_colors.append(mass["tint"])
+			mass_customs.append(mass["custom"])
+			_detail_boxes.append({"transform": mass["transform"]})
+
+		trims.append_array(result.get("trims", []) as Array)
+		fixtures.append_array(result.get("fixtures", []) as Array)
+		pipes.append_array(result.get("pipes", []) as Array)
+		cables.append_array(result.get("cables", []) as Array)
+		ladders.append_array(result.get("ladders", []) as Array)
+		drips.append_array(result.get("drips", []) as Array)
+		_detail_occluders.append_array(result.get("occluders", []) as Array)
+
+		for item: Variant in result.get("niches", []) as Array:
+			var niche: Dictionary = item as Dictionary
+			niches.append(niche["transform"])
+			niche_colors.append(niche["tint"])
+			niche_customs.append(niche["custom"])
+
+		for item: Variant in result.get("billboards", []) as Array:
+			var sign_data: Dictionary = item as Dictionary
+			billboards.append(sign_data["transform"])
+			billboard_colors.append(sign_data["tint"])
+			billboard_customs.append(sign_data["custom"])
+
+		for item: Variant in result.get("holograms", []) as Array:
+			var holo: Dictionary = item as Dictionary
+			holograms.append(holo["transform"])
+			holo_colors.append(holo["tint"])
+			holo_customs.append(holo["custom"])
+
+		if lights.size() < MAX_DETAIL_LIGHTS:
+			lights.append_array(result.get("lights", []) as Array)
+		if detail_level == DETAIL_NEAR and climb.size() < MAX_CLIMB_ZONES:
+			climb.append_array(result.get("climb_zones", []) as Array)
+
+	# Подворотни — только вблизи: их содержимое видно только вплотную.
+	var alley: Dictionary = {}
+	if detail_level == DETAIL_NEAR:
+		alley = NoirAlleyDresser.generate(buildings, _city_seed, budget)
+
+	_emit_detail_meshes(
+		masses, mass_colors, mass_customs,
+		trims, niches, niche_colors, niche_customs,
+		fixtures, pipes, cables, ladders,
+		billboards, billboard_colors, billboard_customs,
+		holograms, holo_colors, holo_customs
+	)
+	_emit_alley(alley)
+	_emit_detail_lights(lights, alley)
+	if detail_level == DETAIL_NEAR:
+		_emit_particles(drips, alley, float(budget.get("density", 0.7)))
+		_emit_climb_zones(climb)
+
+	_detail_stats = {
+		"detail_masses": masses.size(),
+		"detail_trims": trims.size(),
+		"detail_niches": niches.size(),
+		"detail_fixtures": fixtures.size(),
+		"detail_pipes": pipes.size(),
+		"detail_cables": cables.size(),
+		"detail_ladders": ladders.size(),
+		"detail_billboards": billboards.size(),
+		"detail_holograms": holograms.size(),
+	}
+
+
+func _emit_detail_meshes(
+	masses: Array[Transform3D], mass_colors: Array[Color], mass_customs: Array[Color],
+	trims: Array[Transform3D], niches: Array[Transform3D], niche_colors: Array[Color], niche_customs: Array[Color],
+	fixtures: Array[Transform3D], pipes: Array[Transform3D], cables: Array[Transform3D], ladders: Array[Transform3D],
+	billboards: Array[Transform3D], billboard_colors: Array[Color], billboard_customs: Array[Color],
+	holograms: Array[Transform3D], holo_colors: Array[Color], holo_customs: Array[Color]
+) -> void:
+	_emit_multimesh("Massing", CityMaterials.box_mesh(), CityMaterials.facade, masses, mass_colors, mass_customs, true, 0.0)
+	_emit_multimesh("Trims", CityMaterials.box_mesh(), CityMaterials.concrete, trims, [], [], false, TRIM_VISIBLE_TO)
+	_emit_multimesh("Niches", CityMaterials.quad_mesh(), CityMaterials.glass, niches, niche_colors, niche_customs, false, TRIM_VISIBLE_TO)
+	_emit_multimesh("Fixtures", CityMaterials.box_mesh(), CityMaterials.metal_rust, fixtures, [], [], false, SMALL_DETAIL_VISIBLE_TO)
+	_emit_multimesh("Pipes", CityMaterials.box_mesh(), CityMaterials.metal, pipes, [], [], false, TRIM_VISIBLE_TO)
+	_emit_multimesh("Cables", CityMaterials.box_mesh(), CityMaterials.cable, cables, [], [], false, SMALL_DETAIL_VISIBLE_TO)
+	_emit_multimesh("Ladders", CityMaterials.box_mesh(), CityMaterials.metal_rust, ladders, [], [], false, TRIM_VISIBLE_TO)
+	_emit_multimesh("Billboards", CityMaterials.box_mesh(), CityMaterials.billboard, billboards, billboard_colors, billboard_customs, false, 0.0)
+	_emit_multimesh("Holograms", CityMaterials.quad_mesh(), CityMaterials.hologram, holograms, holo_colors, holo_customs, false, 0.0)
+
+
+func _emit_alley(alley: Dictionary) -> void:
+	if alley.is_empty():
+		return
+	var debris: Array[Transform3D] = []
+	var boxes: Array[Transform3D] = []
+	var pipes: Array[Transform3D] = []
+	debris.append_array(alley.get("debris", []) as Array)
+	boxes.append_array(alley.get("boxes", []) as Array)
+	pipes.append_array(alley.get("pipes", []) as Array)
+
+	_emit_multimesh("AlleyBins", CityMaterials.box_mesh(), CityMaterials.metal_rust, debris, [], [], false, SMALL_DETAIL_VISIBLE_TO)
+	_emit_multimesh("AlleyBoxes", CityMaterials.box_mesh(), CityMaterials.cardboard, boxes, [], [], false, SMALL_DETAIL_VISIBLE_TO)
+	_emit_multimesh("AlleyPipes", CityMaterials.cylinder_mesh(), CityMaterials.metal, pipes, [], [], false, SMALL_DETAIL_VISIBLE_TO)
+
+	for xform: Transform3D in debris:
+		_detail_boxes.append({"transform": xform})
+
+
+## Сборщик MultiMesh. [param visible_to] > 0 включает дистанционное отсечение.
+func _emit_multimesh(node_name: String, mesh: Mesh, material: Material, transforms: Array[Transform3D], colors: Array[Color], customs: Array[Color], shadows: bool, visible_to: float) -> void:
+	if transforms.is_empty():
+		return
+	if mesh == null:
+		Log.warn("CityChunk", "Нет меша для деталей", {"узел": node_name})
+		return
+
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_colors = not colors.is_empty()
+	mm.use_custom_data = not customs.is_empty()
+	mm.mesh = mesh
+	mm.instance_count = transforms.size()
+
+	for i: int in range(transforms.size()):
+		mm.set_instance_transform(i, transforms[i])
+		if mm.use_colors and i < colors.size():
+			mm.set_instance_color(i, colors[i])
+		if mm.use_custom_data and i < customs.size():
+			mm.set_instance_custom_data(i, customs[i])
+
+	var instance := MultiMeshInstance3D.new()
+	instance.name = node_name
+	instance.multimesh = mm
+	if material != null:
+		instance.material_override = material
+	instance.cast_shadow = (
+		GeometryInstance3D.SHADOW_CASTING_SETTING_ON if shadows
+		else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	)
+	if visible_to > 0.0:
+		instance.visibility_range_end = visible_to
+		instance.visibility_range_end_margin = visible_to * 0.15
+		instance.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
+	add_child(instance)
+	_detail_nodes.append(instance)
+
+
+## Свет от неоновых щитов и ламп в подворотнях. Именно он даёт те самые
+## цветные отражения на мокром асфальте, без него неон — просто наклейка.
+func _emit_detail_lights(lights: Array[Dictionary], alley: Dictionary) -> void:
+	if detail_level != DETAIL_NEAR:
+		return
+
+	var all: Array[Dictionary] = lights.duplicate()
+	if not alley.is_empty():
+		all.append_array(alley.get("lights", []) as Array)
+	if all.is_empty():
+		return
+
+	var allowed: int = mini(MAX_DETAIL_LIGHTS, all.size())
+	var step: int = maxi(1, int(ceil(float(all.size()) / float(allowed))))
+	var index: int = 0
+	while index < all.size() and _detail_lights.size() < MAX_DETAIL_LIGHTS:
+		var data: Dictionary = all[index]
+		var light := OmniLight3D.new()
+		light.name = "NeonLight_%d" % index
+		light.position = data.get("position", Vector3.ZERO)
+		light.light_color = data.get("color", Color.WHITE)
+		light.light_energy = clampf(float(data.get("energy", 1.6)), 0.2, 6.0)
+		light.omni_range = clampf(float(data.get("range", 16.0)), 3.0, 40.0)
+		light.omni_attenuation = 1.5
+		light.shadow_enabled = false
+		light.distance_fade_enabled = true
+		light.distance_fade_begin = 55.0
+		light.distance_fade_length = 25.0
+		add_child(light)
+		_detail_lights.append(light)
+		index += step
+
+
+## Пар из подворотен и капли с кондиционеров. Самое дорогое из деталей,
+## поэтому жёсткий потолок на чанк и только на ближнем LOD.
+func _emit_particles(drips: Array[Vector3], alley: Dictionary, density: float) -> void:
+	if density <= 0.01:
+		return
+
+	var steam_spots: Array = alley.get("steam", []) as Array if not alley.is_empty() else []
+	var steam_allowed: int = maxi(0, MAX_PARTICLE_SYSTEMS - 3)
+	var made: int = 0
+
+	for entry: Variant in steam_spots:
+		if made >= steam_allowed:
+			break
+		if not (entry is Dictionary):
+			continue
+		var spot: Dictionary = entry as Dictionary
+		var emitter: GPUParticles3D = NoirParticleFactory.make_steam(
+			spot.get("position", Vector3.ZERO),
+			float(spot.get("strength", 0.6)),
+			float(spot.get("width", 1.0)),
+			density
+		)
+		if emitter == null:
+			continue
+		add_child(emitter)
+		_particles.append(emitter)
+		made += 1
+
+	# Капли берём не все: шагом по списку, чтобы они были разбросаны по чанку,
+	# а не собраны на одной стене.
+	if drips.is_empty():
+		return
+	var drip_allowed: int = MAX_PARTICLE_SYSTEMS - _particles.size()
+	if drip_allowed <= 0:
+		return
+	var step: int = maxi(1, int(ceil(float(drips.size()) / float(drip_allowed))))
+	var i: int = 0
+	while i < drips.size() and _particles.size() < MAX_PARTICLE_SYSTEMS:
+		var drop: GPUParticles3D = NoirParticleFactory.make_drip(drips[i], density)
+		if drop != null:
+			add_child(drop)
+			_particles.append(drop)
+		i += step
+
+
+func _emit_climb_zones(zones: Array[Dictionary]) -> void:
+	for entry: Variant in zones:
+		if _climb_areas.size() >= MAX_CLIMB_ZONES:
+			return
+		if not (entry is Dictionary):
+			continue
+		var zone: Dictionary = entry as Dictionary
+		var area: NoirClimbArea = NoirClimbArea.create(
+			zone.get("position", Vector3.ZERO),
+			zone.get("size", Vector3.ONE),
+			zone.get("normal", Vector3.FORWARD),
+			float(zone.get("top_y", 0.0))
+		)
+		if area == null:
+			continue
+		add_child(area)
+		_climb_areas.append(area)
 
 
 # ---------------------------------------------------------------- дороги
@@ -396,13 +811,32 @@ func _build_collision() -> void:
 		shape.position = b["center"]
 		_body.add_child(shape)
 
+	# ФАЗА 3: крупные детали тоже твёрдые — стилобаты, эркеры, баки.
+	# Мелочь (кабели, подоконники) коллизий не получает: их тысячи,
+	# а игрок всё равно упирается в стену за ними.
+	for entry: Dictionary in _detail_boxes:
+		var xform: Transform3D = entry["transform"]
+		var size := Vector3(xform.basis.x.length(), xform.basis.y.length(), xform.basis.z.length())
+		if size.y < 0.6 or minf(size.x, size.z) < 0.6:
+			continue
+		var shape := CollisionShape3D.new()
+		var box := BoxShape3D.new()
+		box.size = size
+		shape.shape = box
+		shape.position = xform.origin
+		_body.add_child(shape)
+
 
 # ---------------------------------------------------------------- окклюзия
 
 ## Один ArrayOccluder3D на весь чанк вместо сотни BoxOccluder3D — иначе
 ## стоимость самой окклюзии съедает выигрыш от неё.
 func _build_occluder() -> void:
-	var boxes: Array = _content.get("occluders", [])
+	var boxes: Array = []
+	boxes.append_array(_content.get("occluders", []) as Array)
+	# ФАЗА 3-4: стилобаты и уступы тоже глухие, иначе через них видна
+	# вся соседняя улица с тысячами вывесок.
+	boxes.append_array(_detail_occluders)
 	if boxes.is_empty():
 		return
 
