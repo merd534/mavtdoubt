@@ -12,7 +12,7 @@ config_version=5
 
 config/name="Neon Noir: Shadows of Rain"
 config/description="Процедурный нуарно-неоновый детектив. Город и преступления генерируются на лету."
-run/main_scene="res://scenes/dev/Phase2CityBench.tscn"
+run/main_scene="res://scenes/dev/Phase3DetailBench.tscn"
 config/use_custom_user_dir=true
 config/custom_user_dir_name="NeonNoirShadowsOfRain"
 config/features=PackedStringArray("4.6", "Forward Plus")
@@ -21,6 +21,8 @@ config/features=PackedStringArray("4.6", "Forward Plus")
 
 Log="*res://scripts/core/Logger.gd"
 GameConfig="*res://scripts/core/GameConfig.gd"
+Settings="*res://scripts/core/SettingsManager.gd"
+Difficulty="*res://scripts/gameplay/DifficultyManager.gd"
 CityAtlas="*res://scripts/world/CityAtlas.gd"
 CityMaterials="*res://scripts/city/CityMaterials.gd"
 WorldClock="*res://scripts/world/WorldClock.gd"
@@ -52,3 +54,6 @@ renderer/rendering_method.mobile="gl_compatibility"
 environment/defaults/default_clear_color=Color(0.039215688, 0.047058824, 0.07058824, 1)
 anti_aliasing/quality/screen_space_aa=1
 occlusion_culling/use_occlusion_culling=true
+occlusion_culling/bvh_build_quality=2
+occlusion_culling/occlusion_rays_per_thread=32
+limits/spatial_indexer/threaded_cull_minimum_instances=500
