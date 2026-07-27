@@ -6,13 +6,18 @@ extends RefCounted
 ## менять количество частиц без перезагрузки ресурсов. Плотность приходит
 ## извне (0..1); при 0 система не создаётся вовсе и не тратит ни байта:
 ## именно так работает пресет Картошка, где пара и капель нет совсем.
+##
+## Про разброс времени жизни: у GPUParticles3D, в отличие от CPUParticles3D, нет
+## свойства `lifetime_randomness`. За разброс отвечает `randomness`
+## (Randomness Ratio) — оно растаскивает и время жизни, и прочие параметры
+## частицы, а точечный разброс по жизни задаётся кривой в process-материале.
 
 const STEAM_BASE_AMOUNT := 24
 const DRIP_BASE_AMOUNT := 14
 
 
 ## Пар из трубы или решётки. [param strength] — напор (0..1).
-static func make_steam(position: Vector3, strength: float, width: float, density: float) -> GPUParticles3D:
+static func make_steam(spawn_point: Vector3, strength: float, width: float, density: float) -> GPUParticles3D:
 	if density <= 0.01:
 		return null
 
@@ -39,11 +44,11 @@ static func make_steam(position: Vector3, strength: float, width: float, density
 
 	var node := GPUParticles3D.new()
 	node.name = "Steam"
-	node.position = position
+	node.position = spawn_point
 	node.amount = amount
 	node.lifetime = 3.4
-	node.lifetime_randomness = 0.4
 	node.preprocess = 1.5
+	# 0.6 — сильный разброс: клубы пара не должны уходить волной.
 	node.randomness = 0.6
 	node.local_coords = false
 	node.draw_order = GPUParticles3D.DRAW_ORDER_VIEW_DEPTH
@@ -60,7 +65,7 @@ static func make_steam(position: Vector3, strength: float, width: float, density
 
 
 ## Капли воды, стекающие с кондиционера.
-static func make_drip(position: Vector3, density: float) -> GPUParticles3D:
+static func make_drip(spawn_point: Vector3, density: float) -> GPUParticles3D:
 	if density <= 0.01:
 		return null
 
@@ -78,10 +83,10 @@ static func make_drip(position: Vector3, density: float) -> GPUParticles3D:
 
 	var node := GPUParticles3D.new()
 	node.name = "Drip"
-	node.position = position
+	node.position = spawn_point
 	node.amount = maxi(3, int(round(float(DRIP_BASE_AMOUNT) * clampf(density, 0.0, 1.5))))
 	node.lifetime = 1.6
-	node.lifetime_randomness = 0.5
+	# Каплям разброс нужен ещё сильнее, иначе они капают очередями.
 	node.randomness = 0.8
 	node.fixed_fps = 30
 	node.interpolate = true
