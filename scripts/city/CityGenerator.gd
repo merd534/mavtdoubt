@@ -8,6 +8,15 @@ extends Node3D
 ## не больше [member build_budget_ms] миллисекунд за кадр. Город догружается за
 ## несколько кадров, но кадр не проваливается.
 ##
+## ФАЗА 4 добавила третью ступень стриминга. Раньше было два состояния:
+## «чанк есть» и «чанка нет», и на границе радиуса город постоянно пересобирался,
+## стоит игроку сделать два шага вперёд-назад. Теперь:
+##
+##   1. ближнее кольцо         — видимо, детализировано, физика включена;
+##   2. буферное кольцо        — геометрия жива, но скрыта целиком (0 вызовов
+##      отрисовки, нет физики, нет частиц) — возврат стоит один флаг;
+##   3. за буфером            — полная выгрузка из памяти.
+##
 ## Уровни детализации назначаются по расстоянию в чанках и пересобираются
 ## на лету, когда игрок приближается или отдаляется.
 
@@ -19,9 +28,17 @@ const INTERIOR_ENTER_RADIUS := 26.0
 const INTERIOR_RELEASE_RADIUS := 55.0
 const INTERIOR_CHECK_INTERVAL := 0.25
 const OBSERVER_MOVE_EPSILON := 12.0
+## Сколько колец за видимым радиусом держать скрытыми, если в настройках
+## ничего не указано.
+const HIDE_RING_DEFAULT := 1
+## Дальше этого расстояния от игрока мебель открытого интерьера гаснет,
+## а потом выгружается: сам каркас остаётся, чтобы окна не стали дырами.
+const FURNITURE_SLEEP_RADIUS := 34.0
+const FURNITURE_UNLOAD_RADIUS := 48.0
 
 signal chunk_built(coords: Vector2i, build_ms: int)
 signal chunk_released(coords: Vector2i)
+signal chunk_hidden(coords: Vector2i, hidden: bool)
 signal streaming_idle(loaded_chunks: int)
 signal interior_opened(location_id: String)
 signal interior_closed(location_id: String)
@@ -36,6 +53,8 @@ signal interior_closed(location_id: String)
 ## Освобождение тоже размазываем: при быстром перелёте кольцо целиком
 ## становится ненужным, и разовое удаление 69 чанков роняло кадр до 14 FPS.
 @export var max_releases_per_frame: int = 3
+## ФАЗА 4. Агрессивное отсечение невидимого. Выключать только для отладки.
+@export var use_occlusion_culling: bool = true
 
 var _observer: Node3D = null
 var _observer_position: Vector3 = Vector3.ZERO
@@ -44,6 +63,7 @@ var _last_stream_position: Vector3 = Vector3(1e9, 1e9, 1e9)
 var _chunks: Dictionary = {}          # Vector2i -> NoirCityChunk
 var _queue: Array[Vector2i] = []
 var _queued: Dictionary = {}          # Vector2i -> уровень детализации
+var _hidden_wanted: Dictionary = {}   # Vector2i -> bool, желаемая скрытость
 var _release_queue: Array[Vector2i] = []
 var _grid_size: Vector2i = Vector2i.ZERO
 var _grid_origin: Vector2 = Vector2.ZERO
@@ -61,6 +81,7 @@ var _interior_root: Node3D = null
 var _was_idle: bool = false
 var _total_build_ms: int = 0
 var _built_count: int = 0
+var _hidden_count: int = 0
 
 
 func _ready() -> void:
@@ -93,12 +114,43 @@ func _ready() -> void:
 		int(ceil(bounds.size.y / chunk_size))
 	)
 
+	_configure_occlusion_culling()
+
 	Log.info("CityGenerator", "Генератор города поднят", {
 		"чанк_м": chunk_size,
 		"сетка": "%dx%d" % [_grid_size.x, _grid_size.y],
 		"всего_чанков": _grid_size.x * _grid_size.y,
 		"бюджет_мс": build_budget_ms,
+		"окклюзия": use_occlusion_culling,
 	})
+
+
+## ФАЗА 4. Отсечение невидимого. Громадные здания ставят окклюдеры
+## (см. `CityChunk._build_occluder`), а здесь мы включаем сам механизм и поднимаем
+## ему точность: без этого видеокарта обрабатывает тысячи вывесок и деталей
+## интерьера, спрятанных за ближайшей стеной.
+func _configure_occlusion_culling() -> void:
+	var viewport: Viewport = get_viewport()
+	if viewport == null:
+		Log.warn("CityGenerator", "Viewport недоступен — окклюзия не настроена")
+		return
+
+	RenderingServer.viewport_set_use_occlusion_culling(viewport.get_viewport_rid(), use_occlusion_culling)
+
+	if not use_occlusion_culling:
+		Log.info("CityGenerator", "Occlusion Culling выключен вручную")
+		return
+
+	# Больше лучей — агрессивнее отсечение. 32 луча на поток дают заметный
+	# выигрыш на плотной застройке и практически не видны на CPU.
+	RenderingServer.occlusion_rays_per_thread = 32
+	if ProjectSettings.has_setting("rendering/occlusion_culling/bvh_build_quality"):
+		# 2 = HIGH. Перестройка BVH идёт при загрузке чанка, а не каждый кадр.
+		ProjectSettings.set_setting("rendering/occlusion_culling/bvh_build_quality", 2)
+	if ProjectSettings.has_setting("rendering/occlusion_culling/occlusion_rays_per_thread"):
+		ProjectSettings.set_setting("rendering/occlusion_culling/occlusion_rays_per_thread", 32)
+
+	Log.info("CityGenerator", "Occlusion Culling включён", {"лучей_на_поток": 32})
 
 
 func _process(delta: float) -> void:
@@ -115,6 +167,7 @@ func _process(delta: float) -> void:
 	if _interior_timer <= 0.0:
 		_interior_timer = INTERIOR_CHECK_INTERVAL
 		_update_interiors()
+		_update_interior_detail()
 
 
 # ---------------------------------------------------------------- публичный API
@@ -144,6 +197,10 @@ func loaded_chunk_count() -> int:
 
 func queued_chunk_count() -> int:
 	return _queue.size()
+
+
+func hidden_chunk_count() -> int:
+	return _hidden_count
 
 
 func is_idle() -> bool:
@@ -185,16 +242,21 @@ func chunk_rect(coords: Vector2i) -> Rect2:
 func stats() -> Dictionary:
 	var by_detail: Array[int] = [0, 0, 0]
 	var buildings: int = 0
+	var hidden: int = 0
 	for key: Variant in _chunks.keys():
 		var chunk: NoirCityChunk = _chunks[key]
 		if chunk == null or not is_instance_valid(chunk):
 			continue
 		by_detail[clampi(chunk.detail_level, 0, 2)] += 1
 		buildings += chunk.building_count()
+		if chunk.is_hidden_chunk():
+			hidden += 1
+	_hidden_count = hidden
 
 	return {
 		"chunks_loaded": _chunks.size(),
 		"chunks_queued": _queue.size(),
+		"chunks_hidden": hidden,
 		"chunks_near": by_detail[0],
 		"chunks_mid": by_detail[1],
 		"chunks_far": by_detail[2],
@@ -203,6 +265,7 @@ func stats() -> Dictionary:
 		"interiors_open": _interiors.size(),
 		"avg_build_ms": 0.0 if _built_count == 0 else float(_total_build_ms) / float(_built_count),
 		"grid": "%dx%d" % [_grid_size.x, _grid_size.y],
+		"occlusion": use_occlusion_culling,
 	}
 
 
@@ -215,23 +278,38 @@ func _stream_radius() -> int:
 	return clampi(by_distance, 1, cap)
 
 
+## Ширина буферного кольца в чанках. На «Картошке» буфер нулевой:
+## там важна память, а не плавность догрузки.
+func _hide_ring() -> int:
+	var graphics: Dictionary = GameConfig.section("graphics")
+	var value: int = int(graphics.get("hide_radius_chunks", HIDE_RING_DEFAULT))
+	return clampi(value, 0, 4)
+
+
 func _update_streaming() -> void:
 	var center: Vector2i = chunk_coords_at(_observer_position)
 	var radius: int = _stream_radius()
+	var total: int = radius + _hide_ring()
 
 	var wanted: Dictionary = {}
-	for dx: int in range(-radius, radius + 1):
-		for dy: int in range(-radius, radius + 1):
+	_hidden_wanted.clear()
+	for dx: int in range(-total, total + 1):
+		for dy: int in range(-total, total + 1):
 			var coords := Vector2i(center.x + dx, center.y + dy)
 			if coords.x < 0 or coords.y < 0 or coords.x >= _grid_size.x or coords.y >= _grid_size.y:
 				continue
 			# Круглое, а не квадратное кольцо — углы квадрата вдвое дальше центра
 			# и стоили бы впустую.
-			if Vector2(float(dx), float(dy)).length() > float(radius) + 0.5:
+			var length: float = Vector2(float(dx), float(dy)).length()
+			if length > float(total) + 0.5:
 				continue
-			wanted[coords] = _detail_for(absi(dx), absi(dy))
+			var hidden: bool = length > float(radius) + 0.5
+			# Скрытый чанк всегда дальний: детали всё равно не видны, а при
+			# возврате в видимое кольцо он пересоберётся на нужный LOD.
+			wanted[coords] = NoirCityChunk.DETAIL_FAR if hidden else _detail_for(absi(dx), absi(dy))
+			_hidden_wanted[coords] = hidden
 
-	# Ставим в очередь на выгрузку всё, что вышло за кольцо.
+	# Ставим в очередь на выгрузку всё, что вышло за буфер.
 	_release_queue.clear()
 	for key: Variant in _chunks.keys():
 		var coords: Vector2i = key
@@ -252,9 +330,16 @@ func _update_streaming() -> void:
 	for key: Variant in wanted.keys():
 		var coords: Vector2i = key
 		var detail: int = int(wanted[coords])
+		var hidden: bool = bool(_hidden_wanted.get(coords, false))
 		if _chunks.has(coords):
 			var chunk: NoirCityChunk = _chunks[coords]
-			if chunk != null and is_instance_valid(chunk) and chunk.detail_level != detail:
+			if chunk == null or not is_instance_valid(chunk):
+				continue
+			# Сначала скрытость: это бесплатно и срабатывает в том же кадре.
+			if chunk.is_hidden_chunk() != hidden:
+				chunk.set_hidden(hidden)
+				chunk_hidden.emit(coords, hidden)
+			if chunk.detail_level != detail:
 				pending_detail.append(coords)
 				_queued[coords] = detail
 			continue
@@ -317,6 +402,7 @@ func _build_next() -> void:
 		return
 	var coords: Vector2i = _queue.pop_front()
 	var detail: int = int(_queued.get(coords, NoirCityChunk.DETAIL_FAR))
+	var hidden: bool = bool(_hidden_wanted.get(coords, false))
 	_queued.erase(coords)
 
 	# Чанк уже стоит — значит это заявка на смену детализации.
@@ -327,11 +413,16 @@ func _build_next() -> void:
 			if typed.detail_level != detail:
 				typed.set_detail(detail, CityAtlas.city_seed)
 				_reindex_entrances(typed)
+			if typed.is_hidden_chunk() != hidden:
+				typed.set_hidden(hidden)
+				chunk_hidden.emit(coords, hidden)
 		return
 
 	var chunk: NoirCityChunk = NoirCityChunk.create(coords, chunk_rect(coords), detail)
 	_chunk_root.add_child(chunk)
 	var build_ms: int = chunk.build(CityAtlas.city_seed)
+	if hidden:
+		chunk.set_hidden(true)
 
 	_chunks[coords] = chunk
 	_total_build_ms += build_ms
@@ -347,7 +438,12 @@ func _release_chunk(coords: Vector2i) -> void:
 	if chunk is NoirCityChunk and is_instance_valid(chunk as NoirCityChunk):
 		var typed: NoirCityChunk = chunk as NoirCityChunk
 		for entry: Variant in typed.entrances():
-			_entrances.erase(str((entry as Dictionary)["location_id"]))
+			var location_id: String = str((entry as Dictionary)["location_id"])
+			_entrances.erase(location_id)
+			# Интерьер без чанка висеть не должен: иначе после выгрузки города
+			# останутся парящие в воздухе квартиры.
+			if _interiors.has(location_id):
+				_close_interior(location_id)
 		typed.dispose()
 	chunk_released.emit(coords)
 
@@ -385,6 +481,30 @@ func _update_interiors() -> void:
 			to_close.append(location_id)
 	for location_id: String in to_close:
 		_close_interior(location_id)
+
+
+## ФАЗА 4. Ступенчатая выгрузка мебели внутри ещё открытых интерьеров.
+## Мебель — самая тяжёлая часть интерьера и самая бесполезная, пока игрок
+## стоит на улице перед подъездом.
+func _update_interior_detail() -> void:
+	if _interiors.is_empty():
+		return
+
+	for key: Variant in _interiors.keys():
+		var location_id: String = str(key)
+		var node: Variant = _interiors[key]
+		if not (node is Node3D) or not is_instance_valid(node as Node3D):
+			continue
+		var interior: Node3D = node as Node3D
+		var entrance: Variant = _entrances.get(location_id, null)
+		if entrance == null:
+			continue
+		var distance: float = _observer_position.distance_to(entrance as Vector3)
+
+		if distance > FURNITURE_UNLOAD_RADIUS:
+			NoirInteriorFactory.unload_furniture(interior)
+		else:
+			NoirInteriorFactory.set_furniture_active(interior, distance <= FURNITURE_SLEEP_RADIUS)
 
 
 func _open_interior(location_id: String) -> void:
