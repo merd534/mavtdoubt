@@ -1,0 +1,54 @@
+; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
+
+config_version=5
+
+[application]
+
+config/name="Neon Noir: Shadows of Rain"
+config/description="Процедурный нуарно-неоновый детектив. Город и преступления генерируются на лету."
+run/main_scene="res://scenes/dev/Phase2CityBench.tscn"
+config/use_custom_user_dir=true
+config/custom_user_dir_name="NeonNoirShadowsOfRain"
+config/features=PackedStringArray("4.6", "Forward Plus")
+
+[autoload]
+
+Log="*res://scripts/core/Logger.gd"
+GameConfig="*res://scripts/core/GameConfig.gd"
+CityAtlas="*res://scripts/world/CityAtlas.gd"
+CityMaterials="*res://scripts/city/CityMaterials.gd"
+WorldClock="*res://scripts/world/WorldClock.gd"
+Citizens="*res://scripts/world/CitizenRegistry.gd"
+Api="*res://scripts/api/ApiConnector.gd"
+CrimeDirector="*res://scripts/crime/CrimeDirector.gd"
+
+[debug]
+
+gdscript/warnings/untyped_declaration=1
+gdscript/warnings/unsafe_property_access=1
+gdscript/warnings/unsafe_method_access=1
+
+[display]
+
+window/size/viewport_width=1920
+window/size/viewport_height=1080
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
+window/vsync/vsync_mode=0
+
+[dotnet]
+
+project/assembly_name="Neon Noir- Shadows of Rain"
+
+[rendering]
+
+renderer/rendering_method.mobile="gl_compatibility"
+environment/defaults/default_clear_color=Color(0.039215688, 0.047058824, 0.07058824, 1)
+anti_aliasing/quality/screen_space_aa=1
+occlusion_culling/use_occlusion_culling=true

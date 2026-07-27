@@ -1,0 +1,91 @@
+[gd_scene load_steps=5 format=3]
+
+[ext_resource type="Script" path="res://scripts/dev/Phase1TestBench.gd" id="1_bench"]
+[ext_resource type="Script" path="res://scripts/crime/ClueSpawner.gd" id="2_spawner"]
+
+[sub_resource type="Environment" id="Environment_noir"]
+background_mode = 1
+background_color = Color(0.0392157, 0.0470588, 0.0705882, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.0784314, 0.109804, 0.164706, 1)
+ambient_light_energy = 0.6
+tonemap_mode = 3
+tonemap_exposure = 0.85
+ssr_enabled = true
+ssao_enabled = true
+ssao_intensity = 1.5
+glow_enabled = true
+glow_intensity = 0.9
+glow_bloom = 0.15
+glow_hdr_threshold = 0.85
+fog_enabled = true
+fog_light_color = Color(0.0549020, 0.0784314, 0.125490, 1)
+fog_light_energy = 0.7
+fog_density = 0.015
+fog_sky_affect = 0.2
+volumetric_fog_enabled = true
+volumetric_fog_density = 0.028
+volumetric_fog_albedo = Color(0.0862745, 0.109804, 0.160784, 1)
+volumetric_fog_emission = Color(0.0392157, 0.0509804, 0.0784314, 1)
+volumetric_fog_length = 96.0
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_panel"]
+bg_color = Color(0.0235294, 0.0274510, 0.0431373, 0.921569)
+border_width_left = 1
+border_width_top = 1
+border_width_right = 1
+border_width_bottom = 1
+border_color = Color(1, 0.164706, 0.427451, 0.470588)
+corner_radius_top_left = 4
+corner_radius_top_right = 4
+corner_radius_bottom_right = 4
+corner_radius_bottom_left = 4
+content_margin_left = 14.0
+content_margin_top = 12.0
+content_margin_right = 14.0
+content_margin_bottom = 12.0
+
+[node name="Phase1TestBench" type="Node3D"]
+script = ExtResource("1_bench")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_noir")
+
+[node name="MoonLight" type="DirectionalLight3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.643, -0.766, 0, 0.766, 0.643, 0, 60, 0)
+light_color = Color(0.470588, 0.564706, 0.792157, 1)
+light_energy = 0.12
+shadow_enabled = true
+directional_shadow_mode = 2
+directional_shadow_max_distance = 180.0
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.906, -0.423, 0, 0.423, 0.906, 0, 9, 16)
+fov = 70.0
+near = 0.05
+far = 1200.0
+
+[node name="Ground" type="MeshInstance3D" parent="."]
+
+[node name="ClueSpawner" type="Node3D" parent="."]
+script = ExtResource("2_spawner")
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="Panel" type="PanelContainer" parent="UI"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 24.0
+offset_top = 24.0
+offset_right = -24.0
+offset_bottom = -24.0
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_styles/panel = SubResource("StyleBoxFlat_panel")
+
+[node name="Output" type="RichTextLabel" parent="UI/Panel"]
+layout_mode = 2
+bbcode_enabled = true
+scroll_following = true
+selection_enabled = true
