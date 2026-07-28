@@ -2,59 +2,50 @@ class_name NoirCityChunk
 extends Node3D
 ## Один чанк города. Превращает данные фабрик в узлы сцены.
 ##
-## Бюджет вызовов отрисовки на чанк держится около трёх десятков независимо от
-## того, сколько в нём зданий, деталей и уличного реквизита: всё однотипное
-## сливается в MultiMesh.
+## Всё однотипное сливается в MultiMesh, поэтому число вызовов отрисовки на чанк
+## почти не зависит от количества зданий и деталей.
 ##
 ## Уровни детализации:
-##   0 — вблизи: архитектурная детализация, подворотни, улицы, тротуары,
-##       частицы, зоны лазания, коллизии, настоящие источники света, входы
-##   1 — средне: здания, крупные объёмы, силуэт башен, вывески, столбы,
-##       тротуары и разметка. Мелочь фасада тут не строится вообще: её
-##       дистанция видимости (120-190 м) заведомо меньше расстояния до
-##       среднего чанка, так что раньше она грузила память и шину, но не
-##       появлялась на экране ни одним пикселем.
+##   0 — вблизи: архитектурная детализация, подворотни, улицы, тротуары, частицы,
+##       зоны лазания, коллизии, настоящий свет, входы
+##   1 — средне: здания, крупные объёмы, силуэт башен, вывески, тротуары, разметка
 ##   2 — далеко: только здания и полотно дорог
 ##
-## [method set_hidden] убирает чанк из отрисовки и физики, не разбирая геометрию.
-##
-## Проходимые дома (флаг `enterable` от `BuildingFactory`) получают не монолитный
-## куб в физике, а оболочку из стен с дверным проёмом — именно поэтому внутрь
-## можно банально войти пешком, а не по скрипту.
+## Проходимые дома (флаг `enterable` от BuildingFactory) получают в физике не
+## монолитный куб, а оболочку из стен с дверным проёмом — именно поэтому внутрь
+## можно войти пешком, а не по скрипту.
 
 const DETAIL_NEAR := 0
 const DETAIL_MID := 1
 const DETAIL_FAR := 2
 
-const MAX_REAL_LIGHTS := 6            ## живых OmniLight3D от фонарей на ближний чанк
-const MAX_DETAIL_LIGHTS := 8          ## живых источников от неона и подворотен
-const MAX_STREET_LIGHTS := 3          ## живых источников от киосков и светофоров
-const MAX_TOWER_LIGHTS := 2           ## маячки на шпилях небоскрёбов
-const MAX_WALK_LIGHTS := 2            ## подсветка витрин на тротуарах
-const MAX_PARTICLE_SYSTEMS := 10      ## GPU-эмиттеров на чанк
+const MAX_REAL_LIGHTS := 6
+const MAX_DETAIL_LIGHTS := 8
+const MAX_STREET_LIGHTS := 3
+const MAX_TOWER_LIGHTS := 2
+const MAX_WALK_LIGHTS := 2
+const MAX_PARTICLE_SYSTEMS := 10
 const MAX_CLIMB_ZONES := 12
 const PROP_VISIBLE_TO := 240.0
 const LAMP_POST_VISIBLE_TO := 420.0
-const TRIM_VISIBLE_TO := 190.0         ## мелкий декор фасада
-const SMALL_DETAIL_VISIBLE_TO := 120.0 ## кабели, щитки, мусор
-const STREET_VISIBLE_TO := 210.0       ## уличный реквизит
-const STREET_SMALL_VISIBLE_TO := 130.0 ## мелочь на тротуарах
-const TOWER_SMALL_VISIBLE_TO := 520.0  ## оборудование на крышах башен
-const MASS_SMALL_VISIBLE_TO := 330.0   ## мелкие объёмы фасада: эркеры, подоконники
-const SIDEWALK_VISIBLE_TO := 430.0     ## плиты тротуаров и бордюры
-const PAINT_VISIBLE_TO := 270.0        ## дорожная разметка
-const WALK_PROP_VISIBLE_TO := 155.0    ## люки, вазоны, столбики, шкафы
+const TRIM_VISIBLE_TO := 190.0
+const SMALL_DETAIL_VISIBLE_TO := 120.0
+const STREET_VISIBLE_TO := 210.0
+const STREET_SMALL_VISIBLE_TO := 130.0
+const TOWER_SMALL_VISIBLE_TO := 520.0
+const MASS_SMALL_VISIBLE_TO := 330.0
+const SIDEWALK_VISIBLE_TO := 430.0
+const PAINT_VISIBLE_TO := 270.0
+const WALK_PROP_VISIBLE_TO := 155.0
 
 ## Толщина стены в коллизии-оболочке проходимого дома.
 const SHELL_THICKNESS := 0.5
 
-## Порог «крупного» объёма. Всё, что меньше, не отбрасывает тень: на экране
-## такая тень занимает доли пикселя, а в проход теней уходит полноценный
-## инстанс. Это главный источник просадки после детализации фасадов.
+## Порог «крупного» объёма: мелочь тени не отбрасывает — на экране она занимает
+## доли пикселя, а в проход теней уходит полноценный инстанс.
 const MASS_SHADOW_MIN_HEIGHT := 3.5
 const MASS_SHADOW_MIN_SIDE := 1.6
 
-## Материал дорожной разметки. Один на всю игру: краска не зависит от чанка.
 static var _paint_material: StandardMaterial3D = null
 
 var coords: Vector2i = Vector2i.ZERO
@@ -85,7 +76,7 @@ var _tower_lights: Array[OmniLight3D] = []
 var _walk_lights: Array[OmniLight3D] = []
 var _particles: Array[GPUParticles3D] = []
 var _climb_areas: Array[NoirClimbArea] = []
-var _detail_boxes: Array[Dictionary] = []   ## боксы для коллизий деталей
+var _detail_boxes: Array[Dictionary] = []
 var _detail_occluders: Array[Dictionary] = []
 var _enterable_count: int = 0
 
@@ -96,11 +87,11 @@ static func create(chunk_coords: Vector2i, chunk_rect: Rect2, detail: int) -> No
 	chunk.rect = chunk_rect
 	chunk.detail_level = clampi(detail, DETAIL_NEAR, DETAIL_FAR)
 	chunk.name = "Chunk_%d_%d" % [chunk_coords.x, chunk_coords.y]
-	chunk.position = Vector3.ZERO   # содержимое уже в мировых координатах
+	chunk.position = Vector3.ZERO
 	return chunk
 
 
-## Материал краски создаётся один раз и переиспользуется всеми чанками.
+## Материал дорожной краски создаётся один раз на всю игру.
 static func paint_material() -> StandardMaterial3D:
 	if _paint_material != null:
 		return _paint_material
@@ -128,7 +119,6 @@ func build(city_seed: int) -> int:
 	_build_details()
 	_build_sidewalks()
 	if detail_level == DETAIL_NEAR:
-		# Улицы строятся до коллизий: машины и киоски должны быть твёрдыми.
 		_build_streets()
 		_build_props()
 		_build_collision()
@@ -140,7 +130,6 @@ func build(city_seed: int) -> int:
 	return _build_msec
 
 
-## Меняет уровень детализации. Возвращает true, если потребовалась пересборка.
 func set_detail(level: int, city_seed: int) -> bool:
 	var target: int = clampi(level, DETAIL_NEAR, DETAIL_FAR)
 	if target == detail_level:
@@ -335,9 +324,8 @@ func _detail_budget() -> Dictionary:
 	cfg["holograms"] = density > 0.15
 	cfg["max_elements"] = maxi(24, int(round(float(NoirBuildingDetailer.MAX_ELEMENTS) * clampf(0.3 + density, 0.3, 1.0))))
 
-	# Средний чанк начинается в 240 метрах, а мелочь фасада отсекается на
-	# 120-190. Раньше она всё равно генерировалась и уходила в видеопамять:
-	# чистая потеря без единого видимого пикселя.
+	# Мелочь фасада отсекается на 120-190 м, а средний чанк начинается в 240 м:
+	# генерировать её там — чистая потеря памяти без единого видимого пикселя.
 	if detail_level != DETAIL_NEAR:
 		cfg["cables"] = false
 		cfg["steam"] = false
@@ -349,8 +337,8 @@ func _detail_budget() -> Dictionary:
 	return cfg
 
 
-## Конфиг объёмной детализации небоскрёбов. Плотность берётся из пресета, но
-## силуэт башни нужен даже на слабых машинах: минимум оставляем заметным.
+## Конфиг объёмной детализации небоскрёбов. Силуэт башни нужен даже на слабых
+## машинах, поэтому минимум остаётся заметным.
 func _tower_config() -> Dictionary:
 	var cfg: Dictionary = NoirTowerDetailer.defaults()
 	var graphics: Dictionary = GameConfig.section("graphics")
@@ -359,7 +347,6 @@ func _tower_config() -> Dictionary:
 		density = clampf(float(graphics.get("detail_density", 1.0)), 0.0, 1.5)
 	cfg["density"] = clampf(density, 0.0, 1.5)
 
-	# На средней дистанции нужны только крупные объёмы: подиум, уступы, венец.
 	if detail_level != DETAIL_NEAR:
 		cfg["roof_gear"] = density >= 0.8
 		cfg["fins"] = density >= 0.55
@@ -384,8 +371,6 @@ func _build_details() -> void:
 	if float(budget.get("density", 0.0)) <= 0.01:
 		return
 
-	# Крупные и мелкие объёмы разводятся по разным узлам: первые дают тень и
-	# силуэт, вторые видны только вблизи и в проходе теней не участвуют.
 	var masses: Array[Transform3D] = []
 	var mass_colors: Array[Color] = []
 	var mass_customs: Array[Color] = []
@@ -410,8 +395,6 @@ func _build_details() -> void:
 	var lights: Array[Dictionary] = []
 	var climb: Array[Dictionary] = []
 
-	# Небоскрёбы: отдельные слои, потому что их геометрия видна далеко и
-	# не должна отсекаться вместе с мелочью фасада.
 	var tower_concrete: Array[Transform3D] = []
 	var tower_metal: Array[Transform3D] = []
 	var tower_glass: Array[Transform3D] = []
@@ -446,7 +429,6 @@ func _build_details() -> void:
 
 			_detail_occluders.append_array(result.get("occluders", []) as Array)
 
-			# Мелочь фасада живёт только в ближнем чанке.
 			if near:
 				trims.append_array(result.get("trims", []) as Array)
 				fixtures.append_array(result.get("fixtures", []) as Array)
@@ -478,7 +460,6 @@ func _build_details() -> void:
 			if near and climb.size() < MAX_CLIMB_ZONES:
 				climb.append_array(result.get("climb_zones", []) as Array)
 
-		# ---- объёмная архитектура высоток
 		if not NoirTowerDetailer.is_tower(b):
 			continue
 		var tower: Dictionary = NoirTowerDetailer.detail(b, tower_cfg)
@@ -487,8 +468,6 @@ func _build_details() -> void:
 		towers += 1
 		tower_parts += NoirTowerDetailer.count(tower)
 
-		# Крупные объёмы башни идут тем же материалом фасада: уступы и подиум
-		# получают окна и продолжают читаться как часть здания.
 		for item: Variant in tower.get("masses", []) as Array:
 			var tower_mass: Dictionary = item as Dictionary
 			masses.append(tower_mass["transform"])
@@ -552,7 +531,6 @@ func _build_details() -> void:
 	}
 
 
-## Крупный ли объём. Тень имеет смысл только у того, что заметно на фасаде.
 func _is_big_mass(xform: Transform3D) -> bool:
 	var h: float = xform.basis.y.length()
 	var side: float = minf(xform.basis.x.length(), xform.basis.z.length())
@@ -580,9 +558,7 @@ func _emit_detail_meshes(
 
 
 ## Слои небоскрёбов. Пилястры, карнизы и венцы не отсекаются по дистанции:
-## именно они ломают силуэт коробки, и терять их на 200 метрах нельзя.
-## Тень от бетонных элементов включена только вблизи: дальше карта теней
-## всё равно заканчивается, а инстансы в проход теней уходили.
+## именно они ломают силуэт коробки.
 func _emit_tower_meshes(
 	concrete: Array[Transform3D], metal: Array[Transform3D], glass: Array[Transform3D],
 	poles: Array[Transform3D], neon: Array[Transform3D],
@@ -596,8 +572,6 @@ func _emit_tower_meshes(
 	_emit_multimesh("TowerNeon", CityMaterials.box_mesh(), CityMaterials.neon, neon, neon_colors, neon_customs, false, 0.0)
 
 
-## Маячки на шпилях. Их единицы на чанк: свет дорогой, а читаются они
-## в основном за счёт неонового материала.
 func _emit_tower_lights(lights: Array[Dictionary]) -> void:
 	if lights.is_empty():
 		return
@@ -643,9 +617,6 @@ func _emit_alley(alley: Dictionary) -> void:
 
 # =========================================================== тротуары
 
-## Тротуары, бордюры, разметка и переходы. Строятся и вблизи, и на средней
-## дистанции: без них город с высоты выглядит набором коробок на чёрном поле.
-## Мелкий реквизит тротуара и подсветка витрин — только вблизи.
 func _build_sidewalks() -> void:
 	var roads: Array = _content.get("roads", [])
 	if roads.is_empty() or detail_level >= DETAIL_FAR:
@@ -664,8 +635,6 @@ func _build_sidewalks() -> void:
 	cfg["props"] = near and density > 0.15
 	cfg["signs"] = near and density > 0.1
 	cfg["crosswalks"] = density > 0.05
-	# Разметки на средней дистанции нужно меньше: осевая видна и с высоты,
-	# а отдельные штрихи перехода — нет.
 	cfg["max_paint"] = int(round(float(NoirSidewalkBuilder.MAX_PAINT) * (1.0 if near else 0.45)))
 	cfg["max_slabs"] = int(round(float(NoirSidewalkBuilder.MAX_SLABS) * clampf(0.5 + density * 0.5, 0.5, 1.0)))
 	cfg["max_props"] = int(round(float(NoirSidewalkBuilder.MAX_PROPS) * clampf(density, 0.2, 1.0)))
@@ -698,8 +667,6 @@ func _build_sidewalks() -> void:
 		sign_colors.append(item.get("tint", Color.WHITE))
 		sign_customs.append(item.get("custom", Color(0.0, 0.9, 0.0, 0.0)))
 
-	# Плиты и бордюры не отбрасывают тень: они лежат на земле, и тень от них
-	# невидима, зато инстансов у них сотни.
 	_emit_multimesh("Sidewalks", CityMaterials.box_mesh(), CityMaterials.concrete, slabs, [], [], false, SIDEWALK_VISIBLE_TO)
 	_emit_multimesh("Curbs", CityMaterials.box_mesh(), CityMaterials.concrete, curbs, [], [], false, SIDEWALK_VISIBLE_TO)
 	_emit_multimesh("RoadPaint", CityMaterials.box_mesh(), paint_material(), paint, [], [], false, PAINT_VISIBLE_TO)
@@ -717,8 +684,6 @@ func _build_sidewalks() -> void:
 	_detail_stats["walk_signs"] = signs.size()
 
 
-## Тёплый свет из витрин. Ровно пара источников на чанк: остальное делает
-## неоновый материал вывесок и отражения на мокром асфальте.
 func _emit_walk_lights(lights: Array) -> void:
 	var made: int = 0
 	for entry: Variant in lights:
@@ -745,8 +710,6 @@ func _emit_walk_lights(lights: Array) -> void:
 
 # =========================================================== улицы
 
-## Наполнение улиц: светофоры, урны, скамьи, киоски, будки, машины и лужи.
-## Только ближний LOD: всю эту мелочь видно только с тротуара.
 func _build_streets() -> void:
 	var roads: Array = _content.get("roads", [])
 	if roads.is_empty():
@@ -811,8 +774,6 @@ func _build_streets() -> void:
 	_emit_multimesh("Puddles", CityMaterials.box_mesh(), CityMaterials.glass, puddles, [], [], false, STREET_VISIBLE_TO)
 	_emit_multimesh("StreetNeon", CityMaterials.box_mesh(), CityMaterials.neon, neon, neon_colors, neon_customs, false, 0.0)
 
-	# Киоски, машины и тумбы должны быть твёрдыми: игрок обходит их,
-	# а не проходит насквозь.
 	for xform: Transform3D in street.get("boxes", []) as Array:
 		_detail_boxes.append({"transform": xform})
 
@@ -846,7 +807,7 @@ func _emit_street_lights(lights: Array) -> void:
 		made += 1
 
 
-## Сборщик MultiMesh. [param visible_to] > 0 включает дистанционное отсечение.
+## Сборщик MultiMesh. visible_to > 0 включает дистанционное отсечение.
 func _emit_multimesh(node_name: String, mesh: Mesh, material: Material, transforms: Array[Transform3D], colors: Array[Color], customs: Array[Color], shadows: bool, visible_to: float) -> void:
 	if transforms.is_empty():
 		return
@@ -885,7 +846,6 @@ func _emit_multimesh(node_name: String, mesh: Mesh, material: Material, transfor
 	_detail_nodes.append(instance)
 
 
-## Свет от неоновых щитов и ламп в подворотнях.
 func _emit_detail_lights(lights: Array[Dictionary], alley: Dictionary) -> void:
 	if detail_level != DETAIL_NEAR:
 		return
@@ -917,7 +877,6 @@ func _emit_detail_lights(lights: Array[Dictionary], alley: Dictionary) -> void:
 		index += step
 
 
-## Пар из подворотен и капли с кондиционеров.
 func _emit_particles(drips: Array[Vector3], alley: Dictionary, density: float) -> void:
 	if density <= 0.01:
 		return
@@ -1014,13 +973,19 @@ func _make_surface(rects: Array[Dictionary], node_name: String, material: Materi
 		var c := Vector3(r.end.x, y, r.end.y)
 		var d := Vector3(r.position.x, y, r.end.y)
 
-		st.set_uv(Vector2(0.0, 0.0)); st.add_vertex(a)
-		st.set_uv(Vector2(1.0, 0.0)); st.add_vertex(b)
-		st.set_uv(Vector2(1.0, 1.0)); st.add_vertex(c)
+		st.set_uv(Vector2(0.0, 0.0))
+		st.add_vertex(a)
+		st.set_uv(Vector2(1.0, 0.0))
+		st.add_vertex(b)
+		st.set_uv(Vector2(1.0, 1.0))
+		st.add_vertex(c)
 
-		st.set_uv(Vector2(0.0, 0.0)); st.add_vertex(a)
-		st.set_uv(Vector2(1.0, 1.0)); st.add_vertex(c)
-		st.set_uv(Vector2(0.0, 1.0)); st.add_vertex(d)
+		st.set_uv(Vector2(0.0, 0.0))
+		st.add_vertex(a)
+		st.set_uv(Vector2(1.0, 1.0))
+		st.add_vertex(c)
+		st.set_uv(Vector2(0.0, 1.0))
+		st.add_vertex(d)
 
 	var mesh: ArrayMesh = st.commit()
 	if mesh == null:
@@ -1141,7 +1106,6 @@ func _build_lamps() -> void:
 	add_child(_heads_mm)
 
 
-## Настоящих источников света — единицы на ближний чанк.
 func _build_lights() -> void:
 	var lamps: Array = _content.get("lamps", [])
 	if lamps.is_empty():
@@ -1185,5 +1149,164 @@ func _build_collision() -> void:
 	_body.add_child(ground)
 
 	for entry: Variant in buildings:
+		if not (entry is Dictionary):
+			continue
 		var b: Dictionary = entry as Dictionary
-		# Проходимый дом получает оболочку с проёмом вместо моно
+
+		# Проходимый дом получает оболочку с проёмом вместо монолитного куба.
+		if bool(b.get("enterable", false)):
+			_add_shell_collision(b)
+			_enterable_count += 1
+			continue
+
+		var size: Vector3 = b["size"]
+		var center: Vector3 = b["center"]
+
+		# Башня со стилобатом не должна закупоривать его изнутри: её коллизия
+		# начинается там, где заканчивается нижний объём.
+		var from_y: float = clampf(float(b.get("collision_from_y", 0.0)), 0.0, maxf(0.0, size.y - 1.0))
+		if from_y > 0.01:
+			var rest: float = size.y - from_y
+			size = Vector3(size.x, rest, size.z)
+			center = Vector3(center.x, from_y + rest * 0.5, center.z)
+
+		_add_box_shape(size, center)
+
+	for entry: Dictionary in _detail_boxes:
+		var xform: Transform3D = entry["transform"]
+		var box_size := Vector3(
+			xform.basis.x.length(),
+			xform.basis.y.length(),
+			xform.basis.z.length()
+		)
+		if box_size.x < 0.1 or box_size.y < 0.1 or box_size.z < 0.1:
+			continue
+		_add_box_shape(box_size, xform.origin)
+
+
+## Коллизия проходимого дома: четыре стены с дверным проёмом и плита крыши.
+## Полы и перекрытия приносит интерьер — он грузится раньше, чем игрок дойдёт
+## до крыльца, поэтому провалиться внутрь пустой оболочки нельзя.
+func _add_shell_collision(b: Dictionary) -> void:
+	var size: Vector3 = b["size"]
+	var center: Vector3 = b["center"]
+	var base_y: float = center.y - size.y * 0.5
+	var top: float = base_y + size.y
+	var side: int = int(b.get("door_side", 2))
+	var t: float = SHELL_THICKNESS
+	var door_w: float = minf(NoirBuildingFactory.DOOR_WIDTH, minf(size.x, size.z) - 2.0)
+	var door_h: float = minf(NoirBuildingFactory.DOOR_HEIGHT, size.y - 0.6)
+
+	# 0 = +X, 1 = -X, 2 = +Z, 3 = -Z
+	for face: int in range(4):
+		var along_x: bool = face >= 2
+		var normal_sign: float = 1.0 if face % 2 == 0 else -1.0
+		var wall_size: Vector3 = (
+			Vector3(size.x, size.y, t) if along_x else Vector3(t, size.y, size.z)
+		)
+		var wall_center: Vector3 = (
+			Vector3(center.x, base_y + size.y * 0.5, center.z + normal_sign * (size.z * 0.5 - t * 0.5)) if along_x
+			else Vector3(center.x + normal_sign * (size.x * 0.5 - t * 0.5), base_y + size.y * 0.5, center.z)
+		)
+
+		if face != side or door_w <= 1.2 or door_h <= 1.8:
+			_add_box_shape(wall_size, wall_center)
+			continue
+
+		# Стена с проёмом: два простенка по бокам и перемычка сверху.
+		var span: float = wall_size.x if along_x else wall_size.z
+		var segment: float = (span - door_w) * 0.5
+		if segment > 0.05:
+			for s: int in [-1, 1]:
+				var offset: float = float(s) * (door_w * 0.5 + segment * 0.5)
+				var seg_size: Vector3 = (
+					Vector3(segment, size.y, t) if along_x else Vector3(t, size.y, segment)
+				)
+				var seg_center: Vector3 = wall_center + (
+					Vector3(offset, 0.0, 0.0) if along_x else Vector3(0.0, 0.0, offset)
+				)
+				_add_box_shape(seg_size, seg_center)
+
+		var lintel: float = maxf(0.2, size.y - door_h)
+		var lintel_size: Vector3 = (
+			Vector3(door_w, lintel, t) if along_x else Vector3(t, lintel, door_w)
+		)
+		_add_box_shape(lintel_size, Vector3(wall_center.x, base_y + door_h + lintel * 0.5, wall_center.z))
+
+	# Крыша: по ней можно ходить, и сквозь неё нельзя провалиться внутрь.
+	_add_box_shape(
+		Vector3(size.x, SHELL_THICKNESS, size.z),
+		Vector3(center.x, top - SHELL_THICKNESS * 0.5, center.z)
+	)
+
+
+func _add_box_shape(box_size: Vector3, box_position: Vector3) -> void:
+	if _body == null or not is_instance_valid(_body):
+		return
+	var shape := CollisionShape3D.new()
+	var box := BoxShape3D.new()
+	box.size = Vector3(maxf(0.05, box_size.x), maxf(0.05, box_size.y), maxf(0.05, box_size.z))
+	shape.shape = box
+	shape.position = box_position
+	_body.add_child(shape)
+
+
+# ---------------------------------------------------------------- окклюдеры
+
+func _build_occluder() -> void:
+	var occluders: Array = (_content.get("occluders", []) as Array).duplicate()
+	occluders.append_array(_detail_occluders)
+	if occluders.is_empty():
+		return
+
+	var vertices := PackedVector3Array()
+	var indices := PackedInt32Array()
+	for entry: Variant in occluders:
+		if not (entry is Dictionary):
+			continue
+		var o: Dictionary = entry as Dictionary
+		_append_occluder_box(
+			vertices,
+			indices,
+			o.get("center", Vector3.ZERO),
+			o.get("size", Vector3.ONE)
+		)
+
+	if vertices.is_empty():
+		return
+
+	var shape := ArrayOccluder3D.new()
+	shape.set_arrays(vertices, indices)
+
+	_occluder = OccluderInstance3D.new()
+	_occluder.name = "Occluder"
+	_occluder.occluder = shape
+	add_child(_occluder)
+
+
+## Добавляет один параллелепипед в массивы окклюдера.
+func _append_occluder_box(vertices: PackedVector3Array, indices: PackedInt32Array, center: Vector3, size: Vector3) -> void:
+	var h: Vector3 = size * 0.5
+	if h.x <= 0.05 or h.y <= 0.05 or h.z <= 0.05:
+		return
+
+	var base: int = vertices.size()
+	vertices.append(center + Vector3(-h.x, -h.y, -h.z))
+	vertices.append(center + Vector3(h.x, -h.y, -h.z))
+	vertices.append(center + Vector3(h.x, -h.y, h.z))
+	vertices.append(center + Vector3(-h.x, -h.y, h.z))
+	vertices.append(center + Vector3(-h.x, h.y, -h.z))
+	vertices.append(center + Vector3(h.x, h.y, -h.z))
+	vertices.append(center + Vector3(h.x, h.y, h.z))
+	vertices.append(center + Vector3(-h.x, h.y, h.z))
+
+	var faces: PackedInt32Array = [
+		0, 2, 1, 0, 3, 2,   # низ
+		4, 5, 6, 4, 6, 7,   # верх
+		0, 1, 5, 0, 5, 4,   # -Z
+		3, 2, 6, 3, 6, 7,   # +Z
+		1, 2, 6, 1, 6, 5,   # +X
+		0, 4, 7, 0, 7, 3,   # -X
+	]
+	for i: int in faces:
+		indices.append(base + i)
