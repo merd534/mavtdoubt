@@ -6,12 +6,13 @@ extends RefCounted
 ## 1. ВНУТРЕННИЙ (в границах игровой зоны) — по одному кубу на квартал,
 ##    согласован с реальной застройкой и проявляется только там, где чанков уже нет.
 ## 2. ВНЕШНИЙ (за границей игровой зоны) — фальшивый город-заглушка до
-##    горизонта: никаких текстур и шейдеров фасада, только массы с плоским
-##    материалом и тонкие светящиеся полосы на высотках. Игрок туда не
-##    попадает, поэтому геометрия максимально дешёвая.
+##    горизонта: никаких текстур, шейдеров фасада, теней и коллизий —
+##    только MultiMesh с плоским материалом и светящимися элементами.
 ##
-## Карта режется на «супер-плитки»; у каждой — свой MultiMesh, поэтому весь
-## дальний город стоит несколько десятков вызовов отрисовки.
+## Внешнее кольцо разделено на три пояса, чтобы город не обрывался стеной:
+##   • продолжение застройки вплотную за границей — плотно, с уступами;
+##   • псевдо-окраины — зданий значительно меньше, они низкие и широкие;
+##   • горизонт — редкие острова башен, уходящие в туман.
 
 const TILE_SIZE := 960.0            ## сторона супер-плитки в метрах
 const FADE_BEGIN := 780.0           ## с какой дистанции включается внутренний силуэт
@@ -20,14 +21,19 @@ const MIN_TILE_INSTANCES := 1
 const FLOOR_HEIGHT := 3.4
 
 ## Внешнее кольцо-заглушка.
-const OUTER_MARGIN := 3400.0        ## на сколько город уходит за границу карты
+const OUTER_MARGIN := 4200.0        ## на сколько город уходит за границу карты
 const OUTER_TILE := 1150.0
-const OUTER_PITCH := 138.0          ## шаг фальшивых кварталов
+const OUTER_PITCH := 132.0          ## шаг фальшивых кварталов
 const OUTER_FILL := 0.86            ## доля шага, занятая массой
-const OUTER_H_MIN := 16.0
-const OUTER_H_MAX := 78.0
-const OUTER_TOWER_H := 210.0        ## высота кластерных высоток
-const OUTER_STRIPES := 70           ## лимит светящихся полос на плитку
+const OUTER_H_MIN := 14.0
+const OUTER_H_MAX := 82.0
+const OUTER_TOWER_H := 235.0        ## высота кластерных высоток
+const OUTER_MAX_PARTS := 1600       ## лимит масс на плитку
+const OUTER_STRIPES := 220          ## лимит светящихся элементов на плитку
+
+## Границы поясов в долях OUTER_MARGIN.
+const BELT_CITY := 0.22             ## до этого — продолжение города
+const BELT_SUBURB := 0.62           ## до этого — псевдо-окраины
 
 static var _flat: StandardMaterial3D = null
 static var _glow: StandardMaterial3D = null
@@ -69,8 +75,7 @@ static func build() -> Node3D:
 
 
 ## Один куб на квартал: та же сетка, что у настоящей застройки, но без
-## дробления на участки. Высота — усреднённая по району с той же поправкой
-## «ближе к центру района выше», поэтому силуэт совпадает с реальным городом.
+## дробления на участки.
 static func _coarse_blocks(tile: Rect2) -> Array[Dictionary]:
 	var out: Array[Dictionary] = []
 
@@ -114,8 +119,6 @@ static func _coarse_blocks(tile: Rect2) -> Array[Dictionary]:
 				if CityAtlas.is_in_river(center):
 					continue
 
-				# Детерминированный шум по координатам квартала — без RNG,
-				# чтобы силуэт был стабилен независимо от порядка сборки.
 				var noise: float = _hash01(i * 73856093 + j * 19349663 + CityAtlas.city_seed)
 				if noise > density + 0.15:
 					continue
@@ -132,12 +135,8 @@ static func _coarse_blocks(tile: Rect2) -> Array[Dictionary]:
 
 				out.append({
 					"center": Vector3(center.x, height * 0.5, center.y),
-					# Квартал целиком, а не участок: вблизи это было бы грубо,
-					# но силуэт виден только с 780 м и дальше.
 					"size": Vector3(block_size * 0.92, height, block_size * 0.92),
 					"tint": tint,
-					# Светящихся окон намеренно больше, чем вблизи: с дистанции
-					# они сливаются в тот самый неоновый ковёр.
 					"custom": Color(noise, clampf(0.45 + wealth * 0.4, 0.3, 0.95), clampf(neon * 0.85, 0.0, 0.95), 0.0),
 				})
 
@@ -163,7 +162,6 @@ static func _make_tile(blocks: Array[Dictionary], node_name: String) -> MultiMes
 	node.multimesh = mm
 	node.material_override = CityMaterials.facade_far
 	node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	# Плитка проявляется только там, где настоящих чанков уже нет.
 	node.visibility_range_begin = FADE_BEGIN
 	node.visibility_range_begin_margin = FADE_MARGIN
 	node.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
@@ -172,24 +170,23 @@ static func _make_tile(blocks: Array[Dictionary], node_name: String) -> MultiMes
 
 # --------------------------------------------------- внешнее кольцо-заглушка
 
-## Плоский материал без текстур и без шейдера фасада: за границей игровой
-## зоны важен только образ, а не поверхность.
+## Плоский материал без текстур. Цвет берётся из instance color, чтобы
+## пояса различались по тону, но оставались одним материалом.
 static func flat_material() -> StandardMaterial3D:
 	if _flat != null:
 		return _flat
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.055, 0.065, 0.095)
+	mat.albedo_color = Color(1.0, 1.0, 1.0)
 	mat.roughness = 0.95
 	mat.metallic = 0.0
 	mat.specular_mode = BaseMaterial3D.SPECULAR_DISABLED
-	mat.vertex_color_use_as_albedo = false
+	mat.vertex_color_use_as_albedo = true
 	mat.cull_mode = BaseMaterial3D.CULL_BACK
 	_flat = mat
 	return _flat
 
 
-## Светящиеся полосы на высотках заглушки — единственное украшение внешнего
-## кольца. Цвет идёт из instance color, текстур нет.
+## Светящиеся элементы заглушки: полосы, оконные ленты, маячки.
 static func glow_material() -> StandardMaterial3D:
 	if _glow != null:
 		return _glow
@@ -206,6 +203,7 @@ static func glow_material() -> StandardMaterial3D:
 
 
 ## Кольцо фальшивого города вокруг игровой зоны. Возвращает число масс.
+## Ни одного физического тела здесь не создаётся сознательно.
 static func _build_outer(root: Node3D, bounds: Rect2) -> int:
 	var outer := Rect2(
 		bounds.position - Vector2(OUTER_MARGIN, OUTER_MARGIN),
@@ -221,8 +219,6 @@ static func _build_outer(root: Node3D, bounds: Rect2) -> int:
 				Vector2(outer.position.x + float(tx) * OUTER_TILE, outer.position.y + float(ty) * OUTER_TILE),
 				Vector2(OUTER_TILE, OUTER_TILE)
 			)
-			# Плитки целиком внутри игровой зоны строит не надо — там есть
-			# реальные чанки и внутренние силуэтные плитки.
 			if bounds.encloses(tile):
 				continue
 
@@ -234,11 +230,13 @@ static func _build_outer(root: Node3D, bounds: Rect2) -> int:
 			node.name = "FakeTile_%d_%d" % [tx, ty]
 			var mm := MultiMesh.new()
 			mm.transform_format = MultiMesh.TRANSFORM_3D
+			mm.use_colors = true
 			mm.mesh = CityMaterials.box_mesh()
 			mm.instance_count = masses.size()
 			for i: int in range(masses.size()):
 				var block: Dictionary = masses[i]
 				mm.set_instance_transform(i, Transform3D(Basis.IDENTITY.scaled(block["size"]), block["center"]))
+				mm.set_instance_color(i, block["tint"])
 			node.multimesh = mm
 			node.material_override = flat_material()
 			node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
@@ -267,9 +265,9 @@ static func _build_outer(root: Node3D, bounds: Rect2) -> int:
 	return total
 
 
-## Фальшивые кварталы: ровная сетка с кластерами высоток и затуханием
-## плотности к горизонту, чтобы город растворялся в тумане, а не обрывался
-## стеной. Река продолжается и за границей: там ничего не строим.
+## Фальшивые кварталы. Каждое здание — не один куб, а набор масс:
+## основной объём, уступ, надстройка на крыше и антенна. Поэтому силуэт
+## читается как город, а не как ряд коробок.
 static func _outer_blocks(tile: Rect2, bounds: Rect2) -> Array[Dictionary]:
 	var out: Array[Dictionary] = []
 	var i_from: int = int(floor(tile.position.x / OUTER_PITCH))
@@ -278,78 +276,174 @@ static func _outer_blocks(tile: Rect2, bounds: Rect2) -> Array[Dictionary]:
 	var j_to: int = int(ceil(tile.end.y / OUTER_PITCH))
 	var seed_value: int = CityAtlas.city_seed
 
+	# Оттенки поясов: ближе — городской бетон, дальше — выцветающий туман.
+	var near_tone := Color(0.115, 0.128, 0.164)
+	var far_tone := Color(0.062, 0.072, 0.104)
+
 	for i: int in range(i_from, i_to + 1):
 		for j: int in range(j_from, j_to + 1):
+			if out.size() >= OUTER_MAX_PARTS:
+				return out
+
 			var center := Vector2(float(i) * OUTER_PITCH, float(j) * OUTER_PITCH)
 			if not tile.has_point(center):
 				continue
-			# Внутри игровой зоны заглушки быть не должно.
 			if bounds.has_point(center):
 				continue
 			if CityAtlas.is_in_river(center):
 				continue
 
-			# Расстояние наружу от границы карты.
+			# Расстояние наружу от границы карты в долях кольца.
 			var dx: float = maxf(maxf(bounds.position.x - center.x, center.x - bounds.end.x), 0.0)
 			var dz: float = maxf(maxf(bounds.position.y - center.y, center.y - bounds.end.y), 0.0)
 			var away: float = clampf(maxf(dx, dz) / OUTER_MARGIN, 0.0, 1.0)
-			var fill: float = 0.95 - 0.75 * away
+
+			# Три пояса с разной плотностью и этажностью.
+			var fill: float = 0.0
+			var h_lo: float = OUTER_H_MIN
+			var h_hi: float = OUTER_H_MAX
+			var wide: float = 1.0
+			if away < BELT_CITY:
+				# Продолжение города: плотно и высоко.
+				fill = 0.92
+				h_lo = 22.0
+				h_hi = OUTER_H_MAX
+			elif away < BELT_SUBURB:
+				# Псевдо-окраины: зданий значительно меньше, они низкие,
+				# широкие и расставлены редко — промзона и малоэтажка.
+				var t: float = (away - BELT_CITY) / maxf(0.01, BELT_SUBURB - BELT_CITY)
+				fill = lerpf(0.46, 0.2, t)
+				h_lo = 8.0
+				h_hi = lerpf(34.0, 20.0, t)
+				wide = 1.35
+			else:
+				# Горизонт: только редкие острова застройки.
+				fill = 0.14
+				h_lo = 10.0
+				h_hi = 46.0
+				wide = 1.2
 
 			var noise: float = _hash01(i * 92837111 + j * 689287499 + seed_value)
 			if noise > fill:
 				continue
 
-			# Кластеры высоток: редкие острова башен, чтобы горизонт имел ритм.
-			var cluster: float = _hash01(int(floor(center.x / 620.0)) * 15485863 + int(floor(center.y / 620.0)) * 32452843 + seed_value)
-			var tower_bias: float = clampf((cluster - 0.72) / 0.28, 0.0, 1.0) * (1.0 - away * 0.7)
+			# Кластеры высоток: острова башен, чтобы горизонт имел ритм.
+			var cluster: float = _hash01(int(floor(center.x / 640.0)) * 15485863 + int(floor(center.y / 640.0)) * 32452843 + seed_value)
+			var tower_bias: float = clampf((cluster - 0.74) / 0.26, 0.0, 1.0) * (1.0 - away * 0.55)
 			var roll: float = pow(_hash01(i * 2654435761 + j * 40503 + seed_value), 1.9)
-			var height: float = lerpf(OUTER_H_MIN, OUTER_H_MAX, roll)
-			if tower_bias > 0.0 and roll > 0.55:
-				height = lerpf(height, OUTER_TOWER_H * (0.55 + 0.45 * roll), tower_bias)
-			height *= 1.0 - away * 0.45
-			height = maxf(8.0, height)
+			var height: float = lerpf(h_lo, h_hi, roll)
+			if tower_bias > 0.0 and roll > 0.5 and away < BELT_SUBURB:
+				height = lerpf(height, OUTER_TOWER_H * (0.45 + 0.55 * roll), tower_bias)
+			height = maxf(7.0, height * (1.0 - away * 0.3))
 
-			var side: float = OUTER_PITCH * OUTER_FILL * (0.72 + 0.28 * _hash01(i * 19349663 + j * 83492791))
+			var shape: float = _hash01(i * 19349663 + j * 83492791)
+			var side_x: float = OUTER_PITCH * OUTER_FILL * wide * (0.6 + 0.34 * shape)
+			var side_z: float = side_x * (0.72 + 0.5 * _hash01(i * 374761393 + j * 668265263))
+			var tone: Color = near_tone.lerp(far_tone, away)
+			# Микроразнобой тона: даже без текстур застройка не читается заливкой.
+			tone = tone * (0.82 + 0.36 * shape)
+			var is_tower: bool = height > 95.0
+
 			out.append({
 				"center": Vector3(center.x, height * 0.5, center.y),
-				"size": Vector3(side, height, side * (0.8 + 0.4 * _hash01(i * 374761393 + j * 668265263))),
+				"size": Vector3(side_x, height, side_z),
 				"height": height,
-				"tower": tower_bias > 0.0 and height > 90.0,
+				"tint": tone,
+				"tower": is_tower,
+				"away": away,
+				"shape": shape,
 			})
+
+			# Уступ: верхний ярус уже основного объёма.
+			if height > 34.0 and shape > 0.32:
+				var setback_h: float = height * (0.2 + 0.28 * shape)
+				out.append({
+					"center": Vector3(center.x, height + setback_h * 0.5, center.y),
+					"size": Vector3(side_x * 0.62, setback_h, side_z * 0.62),
+					"height": height + setback_h,
+					"tint": tone * 1.08,
+					"tower": false,
+					"away": away,
+					"shape": shape,
+				})
+
+			# Надстройка на крыше: машинное отделение или бак.
+			if shape < 0.55 and height > 16.0:
+				var cap: float = clampf(height * 0.08, 1.6, 6.0)
+				out.append({
+					"center": Vector3(center.x + side_x * 0.16, height + cap * 0.5, center.y - side_z * 0.14),
+					"size": Vector3(side_x * 0.34, cap, side_z * 0.32),
+					"height": height + cap,
+					"tint": tone * 0.86,
+					"tower": false,
+					"away": away,
+					"shape": shape,
+				})
+
+			# Антенна на высотках — тонкий штырь, добивающий силуэт.
+			if is_tower:
+				var mast: float = height * 0.16
+				out.append({
+					"center": Vector3(center.x, height + mast * 0.5, center.y),
+					"size": Vector3(0.9, mast, 0.9),
+					"height": height + mast,
+					"tint": tone * 0.7,
+					"tower": false,
+					"away": away,
+					"shape": shape,
+				})
 
 	return out
 
 
-## Тонкие вертикальные полосы по граням высоток и красные маячки на шпилях.
+## Светящиеся элементы: оконные ленты на ближних домах, вертикальные
+## полосы на высотках и красные маячки на шпилях.
 static func _outer_stripes(masses: Array[Dictionary]) -> Array[Dictionary]:
 	var out: Array[Dictionary] = []
-	var cold := Color(0.32, 0.78, 1.0)
-	var warm := Color(1.0, 0.68, 0.32)
+	var cold := Color(0.30, 0.72, 1.0)
+	var warm := Color(1.0, 0.66, 0.32)
+	var window_tone := Color(1.0, 0.80, 0.48)
 	var beacon := Color(1.0, 0.2, 0.2)
 
 	for block: Dictionary in masses:
 		if out.size() >= OUTER_STRIPES:
 			break
 		var height: float = float(block["height"])
-		if height < 46.0:
-			continue
 		var center: Vector3 = block["center"]
 		var box_size: Vector3 = block["size"]
+		var away: float = float(block.get("away", 0.0))
+		var shape: float = float(block.get("shape", 0.5))
+
+		# Оконные ленты: две-три горизонтальные светящиеся полоски на фасаде.
+		# Дальние пояса их не получают: там важен только силуэт.
+		if away < BELT_SUBURB and box_size.y > 12.0 and shape > 0.28:
+			var rows: int = 2 if box_size.y < 40.0 else 3
+			for r: int in range(rows):
+				var t: float = (float(r) + 1.0) / (float(rows) + 1.0)
+				out.append({
+					"center": Vector3(center.x, center.y - box_size.y * 0.5 + box_size.y * t, center.z + box_size.z * 0.51),
+					"size": Vector3(box_size.x * 0.78, 0.55, 0.25),
+					"tint": window_tone * (0.55 + 0.45 * shape),
+				})
+
+		if height < 46.0:
+			continue
+
 		var pick: float = _hash01(int(center.x) * 73856093 + int(center.z) * 19349663)
 		var tint: Color = cold if pick < 0.55 else warm
 
 		# Две полосы на противоположных гранях — силуэт читается с любого ракурса.
 		for k: float in [-1.0, 1.0]:
 			out.append({
-				"center": Vector3(center.x, height * 0.52, center.z + k * box_size.z * 0.51),
-				"size": Vector3(box_size.x * 0.16, height * 0.74, 0.5),
+				"center": Vector3(center.x, center.y, center.z + k * box_size.z * 0.51),
+				"size": Vector3(box_size.x * 0.14, box_size.y * 0.82, 0.4),
 				"tint": tint,
 			})
 
 		if bool(block.get("tower", false)):
 			out.append({
-				"center": Vector3(center.x, height + 1.6, center.z),
-				"size": Vector3(1.6, 1.6, 1.6),
+				"center": Vector3(center.x, height + 2.2, center.z),
+				"size": Vector3(1.7, 1.7, 1.7),
 				"tint": beacon,
 			})
 
