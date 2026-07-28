@@ -17,6 +17,10 @@ extends Node3D
 ##   2 — далеко: только здания и полотно дорог
 ##
 ## [method set_hidden] убирает чанк из отрисовки и физики, не разбирая геометрию.
+##
+## Проходимые дома (флаг `enterable` от `BuildingFactory`) получают не монолитный
+## куб в физике, а оболочку из стен с дверным проёмом — именно поэтому внутрь
+## можно банально войти пешком, а не по скрипту.
 
 const DETAIL_NEAR := 0
 const DETAIL_MID := 1
@@ -40,6 +44,9 @@ const MASS_SMALL_VISIBLE_TO := 330.0   ## мелкие объёмы фасада
 const SIDEWALK_VISIBLE_TO := 430.0     ## плиты тротуаров и бордюры
 const PAINT_VISIBLE_TO := 270.0        ## дорожная разметка
 const WALK_PROP_VISIBLE_TO := 155.0    ## люки, вазоны, столбики, шкафы
+
+## Толщина стены в коллизии-оболочке проходимого дома.
+const SHELL_THICKNESS := 0.5
 
 ## Порог «крупного» объёма. Всё, что меньше, не отбрасывает тень: на экране
 ## такая тень занимает доли пикселя, а в проход теней уходит полноценный
@@ -80,6 +87,7 @@ var _particles: Array[GPUParticles3D] = []
 var _climb_areas: Array[NoirClimbArea] = []
 var _detail_boxes: Array[Dictionary] = []   ## боксы для коллизий деталей
 var _detail_occluders: Array[Dictionary] = []
+var _enterable_count: int = 0
 
 
 static func create(chunk_coords: Vector2i, chunk_rect: Rect2, detail: int) -> NoirCityChunk:
@@ -215,6 +223,7 @@ func stats() -> Dictionary:
 		"hidden": _hidden,
 		"build_ms": _build_msec,
 		"buildings": building_count(),
+		"enterable": _enterable_count,
 		"signs": _count("signs"),
 		"props": _count("props"),
 		"lamps": _count("lamps"),
@@ -270,6 +279,7 @@ func _clear_nodes() -> void:
 	_climb_areas.clear()
 	_detail_boxes.clear()
 	_detail_occluders.clear()
+	_enterable_count = 0
 
 
 # ---------------------------------------------------------------- здания
@@ -1176,73 +1186,4 @@ func _build_collision() -> void:
 
 	for entry: Variant in buildings:
 		var b: Dictionary = entry as Dictionary
-		var shape := CollisionShape3D.new()
-		var box := BoxShape3D.new()
-		box.size = b["size"]
-		shape.shape = box
-		shape.position = b["center"]
-		_body.add_child(shape)
-
-	# Крупные детали и уличные объёмы тоже твёрдые. Мелочь коллизий
-	# не получает: её тысячи, а игрок всё равно упирается в стену за ней.
-	for entry: Dictionary in _detail_boxes:
-		var xform: Transform3D = entry["transform"]
-		var box_size := Vector3(xform.basis.x.length(), xform.basis.y.length(), xform.basis.z.length())
-		if box_size.y < 0.6 or minf(box_size.x, box_size.z) < 0.6:
-			continue
-		var shape := CollisionShape3D.new()
-		var box := BoxShape3D.new()
-		box.size = box_size
-		shape.shape = box
-		shape.transform = Transform3D(xform.basis.orthonormalized(), xform.origin)
-		_body.add_child(shape)
-
-
-# ---------------------------------------------------------------- окклюзия
-
-## Один ArrayOccluder3D на весь чанк вместо сотни BoxOccluder3D.
-func _build_occluder() -> void:
-	var boxes: Array = []
-	boxes.append_array(_content.get("occluders", []) as Array)
-	boxes.append_array(_detail_occluders)
-	if boxes.is_empty():
-		return
-
-	var vertices := PackedVector3Array()
-	var indices := PackedInt32Array()
-	vertices.resize(boxes.size() * 8)
-	indices.resize(boxes.size() * 36)
-
-	const CORNERS: Array[Vector3] = [
-		Vector3(-0.5, -0.5, -0.5), Vector3(0.5, -0.5, -0.5),
-		Vector3(0.5, -0.5, 0.5), Vector3(-0.5, -0.5, 0.5),
-		Vector3(-0.5, 0.5, -0.5), Vector3(0.5, 0.5, -0.5),
-		Vector3(0.5, 0.5, 0.5), Vector3(-0.5, 0.5, 0.5),
-	]
-	const FACES: PackedInt32Array = [
-		0, 2, 1, 0, 3, 2,   # низ
-		4, 5, 6, 4, 6, 7,   # верх
-		0, 1, 5, 0, 5, 4,   # -Z
-		1, 2, 6, 1, 6, 5,   # +X
-		2, 3, 7, 2, 7, 6,   # +Z
-		3, 0, 4, 3, 4, 7,   # -X
-	]
-
-	for i: int in range(boxes.size()):
-		var box: Dictionary = boxes[i]
-		var center: Vector3 = box["center"]
-		var box_size: Vector3 = box["size"]
-		var base: int = i * 8
-		for c: int in range(8):
-			vertices[base + c] = center + CORNERS[c] * box_size
-		var index_base: int = i * 36
-		for f: int in range(36):
-			indices[index_base + f] = base + FACES[f]
-
-	var occluder := ArrayOccluder3D.new()
-	occluder.set_arrays(vertices, indices)
-
-	_occluder = OccluderInstance3D.new()
-	_occluder.name = "Occluder"
-	_occluder.occluder = occluder
-	add_child(_occluder)
+		# Проходимый дом получает оболочку с проёмом вместо моно
