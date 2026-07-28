@@ -4,8 +4,13 @@ extends RefCounted
 ## лестничные пролёты, рабочий лифт и разветвлённые вентшахты.
 ##
 ## Строятся **лениво** — только для здания, к которому подошёл игрок, и
-## выгружаются, когда он ушёл. Генерировать интерьеры всем 237 адресам сразу
+## выгружаются, когда он ушёл. Генерировать интерьеры всем домам сразу
 ## бессмысленно: игрок физически не может быть в двух подъездах.
+##
+## Два входа в фабрику:
+##   • [method build] — по идентификатору локации атласа (отель, участок, клуб);
+##   • [method build_for] — по данным любого здания города. Именно он
+##     позволяет зайти в любой рядовой дом, а не только в сюжетный.
 ##
 ## Геометрия собирается в 4 MultiMesh (стены, полы, мебель, металл) плюс два
 ## StaticBody3D — интерьер целиком стоит около 6 вызовов отрисовки.
@@ -30,9 +35,11 @@ const STAIR_STEPS := 12
 const MAX_BASEMENTS := 2
 ## Мебель видна только вблизи: в коридоре через стену её всё равно не видно.
 const FURNITURE_VISIBLE_TO := 32.0
+## Меньше этого пятна строить нечего: внутри не помещается даже коридор.
+const MIN_FOOTPRINT := 7.0
 
 
-## Собирает интерьер для локации. Возвращает узел или null, если строить нечего.
+## Собирает интерьер для локации атласа. Возвращает узел или null.
 static func build(location_id: String) -> Node3D:
 	var loc: Dictionary = CityAtlas.get_location(location_id)
 	if loc.is_empty():
@@ -47,23 +54,68 @@ static func build(location_id: String) -> Node3D:
 	if footprint.x < MIN_ROOM * 2.0 or footprint.y < CORRIDOR_WIDTH + MIN_ROOM * 2.0:
 		footprint = Vector2(maxf(footprint.x, 14.0), maxf(footprint.y, 12.0))
 
-	var floors: int = clampi(int(loc["floors"]), 1, MAX_GENERATED_FLOORS)
-	if int(loc["floors"]) > MAX_GENERATED_FLOORS:
+	return _assemble(
+		location_id,
+		loc["position"] as Vector2,
+		footprint,
+		int(loc["floors"]),
+		true
+	)
+
+
+## Собирает интерьер по данным входа, которые пришли из `BuildingFactory`.
+## Обязательные ключи: `location_id`, `footprint` (Vector2), `floors` (int).
+## Необязательные: `origin` (Vector2 — центр здания в плане), `atlas` (bool).
+##
+## Габариты **не раздуваются** до минимума, как у локаций атласа: иначе
+## комнаты вылезут сквозь фасад на улицу. Узкий дом просто получает
+## открытые этажи без перегородок — чердак или цех, а не квартиры.
+static func build_for(entry: Dictionary) -> Node3D:
+	if entry.is_empty():
+		return null
+
+	var interior_id: String = str(entry.get("location_id", ""))
+	if interior_id.is_empty():
+		Log.warn("InteriorFactory", "Вход без идентификатора — интерьер не строится")
+		return null
+
+	# Сюжетные адреса идут прежним путём: у них свои габариты и этажность.
+	if bool(entry.get("atlas", false)):
+		return build(interior_id)
+
+	var footprint: Vector2 = entry.get("footprint", Vector2.ZERO)
+	if footprint.x < MIN_FOOTPRINT or footprint.y < MIN_FOOTPRINT:
+		return null
+
+	# Стены интерьера ставим внутрь коробки фасада, а не вровень с ней:
+	# иначе две поверхности совпадают и начинают мерцать.
+	footprint = Vector2(footprint.x - 0.35, footprint.y - 0.35)
+
+	var origin: Vector2 = entry.get("origin", Vector2.ZERO)
+	var floors: int = maxi(1, int(entry.get("floors", 1)))
+	return _assemble(interior_id, origin, footprint, floors, false)
+
+
+## Общая сборка. [param rich] — сюжетное здание: у него чаще два подвала.
+static func _assemble(interior_id: String, origin: Vector2, footprint: Vector2, requested_floors: int, rich: bool) -> Node3D:
+	var floors: int = clampi(requested_floors, 1, MAX_GENERATED_FLOORS)
+	if requested_floors > MAX_GENERATED_FLOORS:
 		Log.debug("InteriorFactory", "Этажность урезана для генерации", {
-			"id": location_id, "в_атласе": int(loc["floors"]), "строим": floors,
+			"id": interior_id, "запрошено": requested_floors, "строим": floors,
 		})
 
-	var origin: Vector2 = loc["position"]
 	var rng := RandomNumberGenerator.new()
-	rng.seed = hash(location_id) ^ CityAtlas.city_seed
+	rng.seed = hash(interior_id) ^ CityAtlas.city_seed
 
 	# Подвал есть почти всегда: это основной скрытный путь детектива.
 	var basements: int = 1
-	if rng.randf() < 0.25 and footprint.x > 18.0:
+	if footprint.x < 9.0 or footprint.y < 9.0:
+		basements = 0 if rng.randf() < 0.45 else 1
+	if rich and rng.randf() < 0.25 and footprint.x > 18.0:
 		basements = MAX_BASEMENTS
 
 	var root := Node3D.new()
-	root.name = "Interior_" + location_id
+	root.name = "Interior_" + interior_id
 	root.position = Vector3(origin.x, 0.0, origin.y)
 
 	# Списки боксов по материалам: собираем данные, потом заливаем в MultiMesh.
@@ -81,15 +133,17 @@ static func build(location_id: String) -> Node3D:
 		_build_slab(slabs, footprint, y)
 		_build_perimeter(walls, footprint, y)
 		if floor_index < 0:
-			_build_basement_plan(walls, furniture, metal, lamps, rooms, inner, y, floor_index, location_id, rng)
+			_build_basement_plan(walls, furniture, metal, lamps, rooms, inner, y, floor_index, interior_id, rng)
 		else:
-			_build_floor_plan(walls, furniture, lamps, rooms, inner, y, floor_index, location_id, rng)
+			_build_floor_plan(walls, furniture, lamps, rooms, inner, y, floor_index, interior_id, rng)
 
 	# Крышка верхнего этажа.
 	_build_slab(slabs, footprint, float(floors) * FLOOR_HEIGHT)
 
 	_build_stairwell(metal, walls, footprint, floors, basements)
-	_build_elevator(root, metal, walls, footprint, floors, basements)
+	# Лифт только там, где для шахты есть место рядом с лестницей.
+	if footprint.x > STAIR_RUN + ELEVATOR_WIDTH + 2.0 and floors > 1:
+		_build_elevator(root, metal, walls, footprint, floors, basements)
 	_build_vents(metal, footprint, floors, basements, rng)
 
 	_emit_multimesh(root, "Walls", walls, CityMaterials.interior_wall, 0.0)
@@ -101,13 +155,13 @@ static func build(location_id: String) -> Node3D:
 	# Коллизии мебели — отдельное тело: его можно убить вместе с мебелью.
 	_emit_collision(root, "FurnitureCollision", [furniture], 0.4)
 
-	root.set_meta("location_id", location_id)
+	root.set_meta("location_id", interior_id)
 	root.set_meta("floors", floors)
 	root.set_meta("basements", basements)
 	root.set_meta("rooms", rooms)
 
 	Log.info("InteriorFactory", "Интерьер построен", {
-		"локация": location_id, "этажей": floors, "подвалов": basements,
+		"здание": interior_id, "этажей": floors, "подвалов": basements,
 		"комнат": rooms.size(), "стен": walls.size(), "мебели": furniture.size(),
 	})
 	return root
@@ -192,12 +246,34 @@ static func _build_floor_plan(walls: Array[Transform3D], furniture: Array[Transf
 
 	var side_depth: float = (inner.y - CORRIDOR_WIDTH) * 0.5
 	if side_depth < MIN_ROOM:
-		return  # слишком узкое здание — оставляем открытый этаж
+		# Слишком узкое здание — оставляем открытый этаж, но со светом
+		# и парой предметов: голая коробка выглядит как ошибка генератора.
+		var open_rect := Rect2(Vector2(-inner.x * 0.5, -inner.y * 0.5), inner)
+		rooms.append({
+			"id": "%s_f%d_open" % [location_id, floor_index],
+			"floor": floor_index,
+			"rect": open_rect,
+			"center": Vector3(0.0, y + 1.0, 0.0),
+		})
+		_furnish(furniture, lamps, open_rect, y, rng)
+		return
 
 	# Ядро с лестницей и лифтом занимает левый край: квартиры начинаются правее.
 	var core_width: float = STAIR_RUN + ELEVATOR_WIDTH + 1.0
 	var usable_x: float = inner.x - core_width
 	if usable_x < MIN_ROOM:
+		# Маленький дом: только лестничная клетка и одна комната.
+		var small_rect := Rect2(
+			Vector2(-inner.x * 0.5 + core_width * 0.5, -inner.y * 0.5),
+			Vector2(maxf(2.0, inner.x - core_width * 0.5), inner.y)
+		)
+		rooms.append({
+			"id": "%s_f%d_small" % [location_id, floor_index],
+			"floor": floor_index,
+			"rect": small_rect,
+			"center": Vector3(small_rect.get_center().x, y + 1.0, small_rect.get_center().y),
+		})
+		_furnish(furniture, lamps, small_rect, y, rng)
 		return
 
 	var room_count: int = clampi(int(usable_x / rng.randf_range(4.5, 7.0)), 1, 6)
@@ -510,12 +586,12 @@ static func _build_vents(metal: Array[Transform3D], footprint: Vector2, floors: 
 
 		# Магистральный короб вдоль этажа.
 		metal.append(Transform3D(
-			Basis.IDENTITY.scaled(Vector3(footprint.x - WALL_THICKNESS * 2.0 - 1.0, VENT_SIZE, VENT_SIZE)),
+			Basis.IDENTITY.scaled(Vector3(maxf(1.0, footprint.x - WALL_THICKNESS * 2.0 - 1.0), VENT_SIZE, VENT_SIZE)),
 			Vector3(0.0, y, z)
 		))
 		# Перемычка к противоположному стояку — то есть петля, а не тупик.
 		metal.append(Transform3D(
-			Basis.IDENTITY.scaled(Vector3(VENT_SIZE, VENT_SIZE, footprint.y - WALL_THICKNESS * 2.0 - 1.0)),
+			Basis.IDENTITY.scaled(Vector3(VENT_SIZE, VENT_SIZE, maxf(1.0, footprint.y - WALL_THICKNESS * 2.0 - 1.0))),
 			Vector3(-x, y, 0.0)
 		))
 
