@@ -6,16 +6,15 @@ extends RefCounted
 ## содержимое чанка проверяется в headless-прогоне и может считаться в потоке.
 ## Превращением данных в MultiMesh занимается `CityChunk`.
 ##
-## Детерминизм: всё зависит только от (city_seed, координаты чанка). Выгрузили
-## чанк и вернулись — город тот же до последнего вентилятора на крыше.
+## Порядок работы важен и устроен так:
+##   1. резерв под landmark'и атласа;
+##   2. **сначала дороги** всех районов чанка, включая зоны-заполнители;
+##   3. и только потом застройка, которая обязана обходить дорожные коридоры.
+## Раньше порядок был обратный, и магистраль одного района упиралась в торец дома
+## соседнего: сетки у районов разные и друг о друге они не знали.
 ##
-## Бесшовность: сетка кварталов привязана не к чанку, а к границам района.
-## Квартал обрабатывается тем чанком, в который попал его **центр**, поэтому
-## на стыках чанков не бывает ни разрывов, ни задвоенных зданий.
-##
-## Заполнение пустырей: районы атласа — прямоугольники и не стыкуются встык,
-## поэтому непокрытые зоны добирает NoirDistrictInfill — иначе посреди
-## карты остаются пустые поля.
+## Детерминизм: всё зависит только от (city_seed, координаты чанка).
+## Бесшовность: квартал обрабатывает тот чанк, в который попал его центр.
 
 const ARTERIAL_EVERY := 4        ## каждая N-я линия сетки — магистраль
 const ALLEY_WIDTH := 2.2
@@ -26,6 +25,8 @@ const LAMP_SPACING := 26.0
 const FLOOR_HEIGHT := 3.4
 const PODIUM_MIN_HEIGHT := 26.0   ## от какого дома имеет смысл стилобат
 const PODIUM_CHANCE := 0.62
+const ROAD_OVERRUN := 26.0        ## насколько магистраль выходит за границу района
+const CORRIDOR_MARGIN := 1.4      ## зазор между кромкой асфальта и стеной
 
 ## Габариты landmark'ов по типу локации (метры).
 const LANDMARK_FOOTPRINT: Dictionary = {
@@ -58,7 +59,6 @@ const OPEN_AIR_KINDS: PackedInt32Array = [
 
 
 ## Главная точка входа. [param chunk_rect] — прямоугольник чанка в плане.
-## Возвращает словарь массивов, готовых к заливке в MultiMesh.
 static func generate(chunk_rect: Rect2, city_seed: int, detail_level: int) -> Dictionary:
 	var rng := RandomNumberGenerator.new()
 	rng.seed = _chunk_seed(city_seed, chunk_rect)
@@ -73,27 +73,37 @@ static func generate(chunk_rect: Rect2, city_seed: int, detail_level: int) -> Di
 		"occluders": [] as Array[Dictionary],
 	}
 
-	var districts: Array[String] = _districts_touching(chunk_rect)
-
 	# Landmark'и ставим первыми: обычная застройка обязана их обойти.
 	var reserved: Array[Rect2] = []
 	_place_atlas_locations(chunk_rect, result, reserved, rng, detail_level)
 
-	for district_id: String in districts:
+	# Полный список зон чанка: реальные районы + синтетические заполнители
+	# пустырей между ними.
+	var zones: Array[Dictionary] = []
+	for district_id: String in _districts_touching(chunk_rect):
 		var district: Dictionary = CityAtlas.get_district(district_id)
-		if district.is_empty():
-			continue
-		_generate_district_blocks(chunk_rect, district, result, reserved, rng, detail_level)
-		_generate_roads(chunk_rect, district, result, rng, detail_level)
+		if not district.is_empty():
+			zones.append(district)
+	zones.append_array(_gap_zones(chunk_rect, city_seed))
 
-	_fill_gaps(chunk_rect, city_seed, result, reserved, rng, detail_level)
+	# Фаза дорог: собираем полотно и запоминаем коридоры, куда застройке нельзя.
+	var corridors: Array[Rect2] = []
+	for zone: Dictionary in zones:
+		_generate_roads(chunk_rect, zone, result, rng, corridors)
+
+	# Фаза застройки: теперь каждый участок знает про все улицы чанка,
+	# в том числе про улицы соседнего района.
+	for zone: Dictionary in zones:
+		_generate_district_blocks(chunk_rect, zone, result, reserved, corridors, rng, detail_level)
+
 	_collect_occluders(result)
 	return result
 
 
-## Застройка зон, которые не покрыты ни одним реальным районом. Без этого
-## шага в середине карты остаются голые поля между кварталами.
-static func _fill_gaps(chunk_rect: Rect2, city_seed: int, result: Dictionary, reserved: Array[Rect2], rng: RandomNumberGenerator, detail_level: int) -> void:
+## Зоны, которые не покрыты ни одним реальным районом. Без них в середине
+## карты остаются голые поля между кварталами.
+static func _gap_zones(chunk_rect: Rect2, city_seed: int) -> Array[Dictionary]:
+	var out: Array[Dictionary] = []
 	var covered: Array[Rect2] = []
 	for id: String in CityAtlas.district_ids():
 		if id == "outskirts":
@@ -105,15 +115,12 @@ static func _fill_gaps(chunk_rect: Rect2, city_seed: int, result: Dictionary, re
 
 	for gap: Rect2 in NoirDistrictInfill.gaps(chunk_rect, covered):
 		var synth: Dictionary = NoirDistrictInfill.district_for(gap, city_seed)
-		if synth.is_empty():
-			continue
-		_generate_district_blocks(chunk_rect, synth, result, reserved, rng, detail_level)
-		_generate_roads(chunk_rect, synth, result, rng, detail_level)
+		if not synth.is_empty():
+			out.append(synth)
+	return out
 
 
-## Сид чанка. Раньше здесь стояло `| 1` (страховка от нулевого сида) — и оно
-## затирало младший бит, из-за чего соседние значения city_seed давали
-## идентичный город. Теперь биты перемешиваются, а ноль правится явно.
+## Сид чанка. Биты перемешиваются, ноль правится явно.
 static func _chunk_seed(city_seed: int, chunk_rect: Rect2) -> int:
 	var cx: int = int(round(chunk_rect.position.x))
 	var cz: int = int(round(chunk_rect.position.y))
@@ -140,7 +147,7 @@ static func _districts_touching(rect: Rect2) -> Array[String]:
 
 # ------------------------------------------------------------- квартальная сетка
 
-static func _generate_district_blocks(chunk_rect: Rect2, district: Dictionary, result: Dictionary, reserved: Array[Rect2], rng: RandomNumberGenerator, detail_level: int) -> void:
+static func _generate_district_blocks(chunk_rect: Rect2, district: Dictionary, result: Dictionary, reserved: Array[Rect2], corridors: Array[Rect2], rng: RandomNumberGenerator, detail_level: int) -> void:
 	var bounds: Rect2 = district["bounds"]
 	var block_size: float = float(district["block"])
 	var street: float = float(district["street"])
@@ -167,10 +174,10 @@ static func _generate_district_blocks(chunk_rect: Rect2, district: Dictionary, r
 			if CityAtlas.is_in_river(center):
 				continue
 
-			_fill_block(block, district, result, reserved, rng, detail_level)
+			_fill_block(block, district, result, reserved, corridors, rng, detail_level)
 
 
-static func _fill_block(block: Rect2, district: Dictionary, result: Dictionary, reserved: Array[Rect2], rng: RandomNumberGenerator, detail_level: int) -> void:
+static func _fill_block(block: Rect2, district: Dictionary, result: Dictionary, reserved: Array[Rect2], corridors: Array[Rect2], rng: RandomNumberGenerator, detail_level: int) -> void:
 	var density: float = float(district["density"])
 	if rng.randf() > density + 0.12:
 		return  # пустырь или парковка — город не должен быть сплошной стеной
@@ -181,38 +188,67 @@ static func _fill_block(block: Rect2, district: Dictionary, result: Dictionary, 
 			continue
 		if _overlaps_any(lot, reserved):
 			continue
-		# Проверять центр квартала мало: квартал бывает шириной 145 м, и угловой
-		# участок спокойно оказывается в воде.
-		if _lot_in_river(lot):
+		# Главная проверка против тупиков: если участок залез на чужую улицу,
+		# пробуем его обрезать, а если обрезок слишком мал — не строим вовсе.
+		var plot: Rect2 = _clip_from_roads(lot, corridors)
+		if plot.size.x < MIN_LOT or plot.size.y < MIN_LOT:
+			continue
+		if _lot_in_river(plot):
 			continue
 		if rng.randf() > density:
 			continue
-		var building: Dictionary = _make_building(lot, district, rng)
+		var building: Dictionary = _make_building(plot, district, rng)
 		if building.is_empty():
 			continue
 
 		# Стилобат: башню поджимаем и ставим вокруг низкий объём на весь
-		# участок. Два уступа вместо одного параллелепипеда сразу убирают
-		# ощущение «коробки с окнами» и дают крышу-террасу на уровне 3-4 этажа.
+		# участок: два уступа вместо одной коробки.
 		var podium: Dictionary = _make_podium(building, district)
 
 		(result["buildings"] as Array).append(building)
 		if not podium.is_empty():
 			(result["buildings"] as Array).append(podium)
-		reserved.append(lot)
+		reserved.append(plot)
 
-		# Вывески генерируются на ВСЕХ уровнях детализации: это одна MultiMesh
-		# на чанк, зато без них город с высоты превращается в чёрное поле —
-		# именно неоновый ковёр и есть образ с референса.
-		# Декор берёт СВОЙ генератор, засеянный из здания, чтобы пропуск
-		# реквизита на дальнем LOD не сдвигал поток случайных чисел.
 		_add_signs(building, district, result)
 		if detail_level == 0:
 			_add_props(building, district, result)
 
 
-## Стилобат для высокого дома. Меняет [param building] на месте: башня
-## становится уже участка, чтобы низкий объём читался как отдельный уступ.
+## Обрезка участка от дорожных коридоров. Отрезаем только то, что торчит
+## на проезжую часть, с той стороны, где перекрытие меньше: так улица
+## проходит насквозь, а квартал теряет лишь полоску по краю.
+static func _clip_from_roads(lot: Rect2, corridors: Array[Rect2]) -> Rect2:
+	var plot: Rect2 = lot
+	for corridor: Rect2 in corridors:
+		var hit: Rect2 = plot.intersection(corridor)
+		if hit.size.x <= 0.01 or hit.size.y <= 0.01:
+			continue
+		# Коридор проглотил участок целиком — строить негде.
+		if hit.size.x >= plot.size.x - 0.01 and hit.size.y >= plot.size.y - 0.01:
+			return Rect2(plot.position, Vector2.ZERO)
+
+		var cut_left: float = hit.end.x - plot.position.x
+		var cut_right: float = plot.end.x - hit.position.x
+		var cut_top: float = hit.end.y - plot.position.y
+		var cut_bottom: float = plot.end.y - hit.position.y
+		var best: float = minf(minf(cut_left, cut_right), minf(cut_top, cut_bottom))
+
+		if is_equal_approx(best, cut_left):
+			plot = Rect2(Vector2(hit.end.x, plot.position.y), Vector2(plot.end.x - hit.end.x, plot.size.y))
+		elif is_equal_approx(best, cut_right):
+			plot = Rect2(plot.position, Vector2(hit.position.x - plot.position.x, plot.size.y))
+		elif is_equal_approx(best, cut_top):
+			plot = Rect2(Vector2(plot.position.x, hit.end.y), Vector2(plot.size.x, plot.end.y - hit.end.y))
+		else:
+			plot = Rect2(plot.position, Vector2(plot.size.x, hit.position.y - plot.position.y))
+
+		if plot.size.x < MIN_LOT or plot.size.y < MIN_LOT:
+			return Rect2(plot.position, Vector2.ZERO)
+	return plot
+
+
+## Стилобат для высокого дома. Меняет [param building] на месте.
 static func _make_podium(building: Dictionary, district: Dictionary) -> Dictionary:
 	var height: float = float(building["height"])
 	if height < PODIUM_MIN_HEIGHT:
@@ -232,7 +268,6 @@ static func _make_podium(building: Dictionary, district: Dictionary) -> Dictiona
 	var center: Vector3 = building["center"]
 	var tower_lot: Rect2 = lot.grow(-shrink)
 
-	# Башня уже: стилобат выступает вокруг неё на shrink метров.
 	building["size"] = Vector3(tower_lot.size.x, height, tower_lot.size.y)
 	building["rect"] = tower_lot
 
@@ -244,7 +279,7 @@ static func _make_podium(building: Dictionary, district: Dictionary) -> Dictiona
 		"height": podium_height,
 		"floors": maxi(1, int(podium_height / FLOOR_HEIGHT)),
 		"tint": tint,
-		# У стилобата первые этажи — витрины, поэтому светящихся окон больше.
+		# У стилобата первые этажи — витрины, светящихся окон больше.
 		"custom": Color(rng.randf(), clampf(custom.g + 0.22, 0.1, 0.95), custom.b, 0.0),
 		"district": str(district["id"]),
 		"is_landmark": false,
@@ -255,14 +290,11 @@ static func _make_podium(building: Dictionary, district: Dictionary) -> Dictiona
 	}
 
 
-## Делит квартал на 1-4 участка с переулками между ними.
+## Делит квартал на 1-9 участков с переулками между ними.
 static func _subdivide(block: Rect2, district: Dictionary, rng: RandomNumberGenerator) -> Array[Rect2]:
 	var out: Array[Rect2] = []
 	var profile: String = str(district["profile"])
 
-	# Зернистость застройки. На референсе город очень мелкозернистый: дом на
-	# каждые 15-25 м, а не редкие кубы по 50 м. Поэтому дробим агрессивно,
-	# крупные цельные объёмы оставляем только промзоне и порту.
 	var splits: int = 1
 	if profile in ["industrial", "harbor"]:
 		splits = [1, 2, 4][rng.randi_range(0, 2)]
@@ -277,7 +309,6 @@ static func _subdivide(block: Rect2, district: Dictionary, rng: RandomNumberGene
 	if inset.size.x <= MIN_LOT or inset.size.y <= MIN_LOT:
 		return out
 
-	# Мелкая нарезка не имеет смысла на маленьком квартале — понижаем степень.
 	while splits > 1 and (inset.size.x / sqrt(float(splits))) < MIN_LOT + ALLEY_WIDTH:
 		splits = 4 if splits == 9 else (2 if splits == 4 else 1)
 
@@ -296,7 +327,6 @@ static func _subdivide(block: Rect2, district: Dictionary, rng: RandomNumberGene
 			out.append(Rect2(Vector2(inset.position.x, inset.position.y + h + ALLEY_WIDTH), Vector2(inset.size.x, h)))
 		return out
 
-	# 4 или 9 участков сеткой NxN с переулками между ними.
 	var side: int = 2 if splits == 4 else 3
 	var gaps: float = ALLEY_WIDTH * float(side - 1)
 	var lot_w: float = (inset.size.x - gaps) / float(side)
@@ -321,8 +351,7 @@ static func _make_building(lot: Rect2, district: Dictionary, rng: RandomNumberGe
 	var bounds: Rect2 = district["bounds"]
 	var center: Vector2 = lot.get_center()
 
-	# Ближе к центру района — выше: на референсе башни собраны в ядро,
-	# а к краям застройка резко проседает.
+	# Ближе к центру района — выше.
 	var half_diag: float = maxf(1.0, bounds.size.length() * 0.5)
 	var core_bias: float = clampf(1.0 - center.distance_to(bounds.get_center()) / half_diag, 0.0, 1.0)
 	core_bias = pow(core_bias, 1.6)
@@ -330,7 +359,6 @@ static func _make_building(lot: Rect2, district: Dictionary, rng: RandomNumberGe
 	var roll: float = pow(rng.randf(), 2.1)
 	var height: float = h_min + (h_max - h_min) * roll * (0.35 + 1.15 * core_bias)
 	height = clampf(height, h_min, h_max)
-	# Кратно этажу — иначе окна на фасаде обрезаются посередине.
 	height = maxf(FLOOR_HEIGHT, round(height / FLOOR_HEIGHT) * FLOOR_HEIGHT)
 
 	var palette: Array[Color] = CityAtlas.district_palette(str(district["id"]))
@@ -338,9 +366,6 @@ static func _make_building(lot: Rect2, district: Dictionary, rng: RandomNumberGe
 
 	var neon_budget: float = float(district["neon"])
 	var wealth: float = float(district["wealth"])
-
-	# deco_seed берётся ВСЕГДА, независимо от уровня детализации, — так поток
-	# случайных чисел застройки одинаков на любом LOD.
 	var deco_seed: int = rng.randi()
 
 	return {
@@ -379,7 +404,6 @@ static func _place_atlas_locations(chunk_rect: Rect2, result: Dictionary, reserv
 			continue
 
 		if OPEN_AIR_KINDS.has(kind):
-			# Парк/площадь: резервируем место, чтобы туда не влезла застройка.
 			reserved.append(Rect2(position - Vector2(24.0, 24.0), Vector2(48.0, 48.0)))
 			continue
 
@@ -417,8 +441,6 @@ static func _place_atlas_locations(chunk_rect: Rect2, result: Dictionary, reserv
 			"rect": lot,
 		}
 
-		# Landmark тоже получает стилобат: именно у крупных адресов плоская
-		# коробка бросалась в глаза сильнее всего.
 		var podium: Dictionary = _make_podium(building, district)
 
 		(result["buildings"] as Array).append(building)
@@ -426,7 +448,6 @@ static func _place_atlas_locations(chunk_rect: Rect2, result: Dictionary, reserv
 			(result["buildings"] as Array).append(podium)
 		reserved.append(lot.grow(2.0))
 
-		# Вход — точка, из которой Фаза 2 открывает интерьер.
 		(result["entrances"] as Array).append({
 			"location_id": location_id,
 			"position": Vector3(position.x, 0.0, position.y + footprint.y * 0.5 + 1.2),
@@ -485,8 +506,6 @@ static func _add_signs(building: Dictionary, district: Dictionary, result: Dicti
 				half = size.z * 0.5
 				along = size.x
 
-		# Высокие здания — вертикальные вывески вдоль грани (как на референсе),
-		# низкие — горизонтальные ленты над первым этажом.
 		var vertical: bool = height > 26.0 and rng.randf() < 0.72
 		var sign_w: float = 0.0
 		var sign_h: float = 0.0
@@ -528,8 +547,7 @@ static func _add_signs(building: Dictionary, district: Dictionary, result: Dicti
 	_add_roof_crown(building, palette, result, rng)
 
 
-## Светящаяся «корона» под крышей башни и маяк наверху. Именно они рисуют
-## город с высоты: на референсе верхушки башен светятся, а не тонут в темноте.
+## Светящаяся «корона» под крышей башни и маяк наверху.
 static func _add_roof_crown(building: Dictionary, palette: Array[Color], result: Dictionary, rng: RandomNumberGenerator) -> void:
 	var height: float = float(building["height"])
 	if height < 45.0:
@@ -571,7 +589,6 @@ static func _add_roof_crown(building: Dictionary, palette: Array[Color], result:
 			"custom": Color(rng.randf(), 0.7, 0.0, 0.0),
 		})
 
-	# Авиационный маяк — красная точка, видимая сверху.
 	if height > 85.0:
 		var beacon_basis := Basis.looking_at(Vector3.DOWN, Vector3.BACK).scaled(Vector3(1.2, 1.2, 1.0))
 		(result["signs"] as Array).append({
@@ -589,7 +606,6 @@ static func _add_props(building: Dictionary, district: Dictionary, result: Dicti
 	var center: Vector3 = building["center"]
 	var height: float = float(building["height"])
 
-	# Кондиционеры и вентиляция на крыше.
 	var roof_units: int = rng.randi_range(0, 3)
 	for _i: int in range(roof_units):
 		var unit_size := Vector3(rng.randf_range(1.0, 2.2), rng.randf_range(0.6, 1.4), rng.randf_range(1.0, 2.2))
@@ -603,7 +619,6 @@ static func _add_props(building: Dictionary, district: Dictionary, result: Dicti
 			"kind": "roof_unit",
 		})
 
-	# Пожарная лестница на глухой стене — путь на крышу, о котором говорит референс.
 	if height > 12.0 and rng.randf() < 0.55:
 		var side_sign: float = 1.0 if rng.randf() < 0.5 else -1.0
 		var ladder_size := Vector3(0.9, height - 3.0, 0.35)
@@ -617,7 +632,6 @@ static func _add_props(building: Dictionary, district: Dictionary, result: Dicti
 			"kind": "fire_escape",
 		})
 
-	# Мусорные баки и вентшахты в переулке.
 	var ground_units: int = rng.randi_range(0, 2)
 	for _i: int in range(ground_units):
 		var unit_size := Vector3(rng.randf_range(1.4, 2.4), rng.randf_range(1.0, 1.5), rng.randf_range(0.9, 1.4))
@@ -635,7 +649,11 @@ static func _add_props(building: Dictionary, district: Dictionary, result: Dicti
 
 # -------------------------------------------------------------------- дороги
 
-static func _generate_roads(chunk_rect: Rect2, district: Dictionary, result: Dictionary, rng: RandomNumberGenerator, detail_level: int) -> void:
+## Дороги района. Магистрали намеренно выпускаются за границу района
+## на ROAD_OVERRUN метров, чтобы стыковаться с сеткой соседа, а не обрываться
+## ровно по его торцу. Каждая полоса попадает в [param corridors] — туда
+## застройка не залезет.
+static func _generate_roads(chunk_rect: Rect2, district: Dictionary, result: Dictionary, rng: RandomNumberGenerator, corridors: Array[Rect2]) -> void:
 	var bounds: Rect2 = district["bounds"]
 	var block_size: float = float(district["block"])
 	var street: float = float(district["street"])
@@ -655,33 +673,37 @@ static func _generate_roads(chunk_rect: Rect2, district: Dictionary, result: Dic
 		"y": 0.0,
 	})
 
-	# Магистрали: каждая ARTERIAL_EVERY-я линия сетки, вдвое шире обычной улицы.
-	var i_from: int = int(floor((overlap.position.x - bounds.position.x) / pitch))
-	var i_to: int = int(ceil((overlap.end.x - bounds.position.x) / pitch))
+	# Зона, в которой разрешено тянуть магистрали этого района.
+	var reach: Rect2 = chunk_rect.intersection(bounds.grow(ROAD_OVERRUN))
+	if reach.size.x <= 0.0 or reach.size.y <= 0.0:
+		return
+
+	var i_from: int = int(floor((reach.position.x - bounds.position.x) / pitch))
+	var i_to: int = int(ceil((reach.end.x - bounds.position.x) / pitch))
 	for i: int in range(i_from, i_to + 1):
 		if i % ARTERIAL_EVERY != 0:
 			continue
 		var x: float = bounds.position.x + float(i) * pitch - street * 0.5
-		var strip := Rect2(Vector2(x - street * 0.5, overlap.position.y), Vector2(street * 2.0, overlap.size.y))
-		var clipped: Rect2 = strip.intersection(overlap)
+		var strip := Rect2(Vector2(x - street * 0.5, reach.position.y), Vector2(street * 2.0, reach.size.y))
+		var clipped: Rect2 = strip.intersection(reach)
 		if clipped.size.x <= 0.5 or clipped.size.y <= 0.5:
 			continue
 		(result["roads"] as Array).append({"rect": clipped, "arterial": true, "along_x": false, "y": 0.02})
-		# Фонари тоже нужны на всех LOD: янтарные линии магистралей — второй
-		# опознаваемый элемент референса после неона.
+		corridors.append(clipped.grow(CORRIDOR_MARGIN))
 		_add_lamps(clipped, false, result, rng)
 
-	var j_from: int = int(floor((overlap.position.y - bounds.position.y) / pitch))
-	var j_to: int = int(ceil((overlap.end.y - bounds.position.y) / pitch))
+	var j_from: int = int(floor((reach.position.y - bounds.position.y) / pitch))
+	var j_to: int = int(ceil((reach.end.y - bounds.position.y) / pitch))
 	for j: int in range(j_from, j_to + 1):
 		if j % ARTERIAL_EVERY != 0:
 			continue
 		var z: float = bounds.position.y + float(j) * pitch - street * 0.5
-		var strip := Rect2(Vector2(overlap.position.x, z - street * 0.5), Vector2(overlap.size.x, street * 2.0))
-		var clipped: Rect2 = strip.intersection(overlap)
+		var strip := Rect2(Vector2(reach.position.x, z - street * 0.5), Vector2(reach.size.x, street * 2.0))
+		var clipped: Rect2 = strip.intersection(reach)
 		if clipped.size.x <= 0.5 or clipped.size.y <= 0.5:
 			continue
 		(result["roads"] as Array).append({"rect": clipped, "arterial": true, "along_x": true, "y": 0.02})
+		corridors.append(clipped.grow(CORRIDOR_MARGIN))
 		_add_lamps(clipped, true, result, rng)
 
 
@@ -706,7 +728,6 @@ static func _add_lamps(strip: Rect2, along_x: bool, result: Dictionary, rng: Ran
 
 # ------------------------------------------------------------------ окклюдеры
 
-## Окклюдерами делаем только крупные объёмы: мелочь не окупает стоимость растеризации.
 static func _collect_occluders(result: Dictionary) -> void:
 	for building: Variant in result["buildings"] as Array:
 		var b: Dictionary = building as Dictionary
@@ -714,8 +735,6 @@ static func _collect_occluders(result: Dictionary) -> void:
 			continue
 		var size: Vector3 = b["size"]
 		var center: Vector3 = b["center"]
-		# Слегка ужимаем: окклюдер не должен торчать за реальную геометрию,
-		# иначе начнёт срезать видимые объекты.
 		(result["occluders"] as Array).append({
 			"center": center,
 			"size": Vector3(maxf(1.0, size.x - 1.0), maxf(1.0, size.y - 1.0), maxf(1.0, size.z - 1.0)),
@@ -729,7 +748,6 @@ static func _overlaps_any(rect: Rect2, others: Array[Rect2]) -> bool:
 	return false
 
 
-## Участок считается «в воде», если река задевает его центр или любой из углов.
 static func _lot_in_river(lot: Rect2) -> bool:
 	if CityAtlas.is_in_river(lot.get_center()):
 		return true
@@ -745,8 +763,7 @@ static func _lot_in_river(lot: Rect2) -> bool:
 	return false
 
 
-## Персональный генератор для декора здания. Не трогает основной поток
-## случайных чисел, поэтому набор зданий одинаков на всех уровнях детализации.
+## Персональный генератор для декора здания.
 static func _deco_rng(building: Dictionary, salt: int) -> RandomNumberGenerator:
 	var rng := RandomNumberGenerator.new()
 	var base: int = int(building.get("deco_seed", 0))
