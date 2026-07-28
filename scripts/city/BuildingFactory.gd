@@ -13,6 +13,10 @@ extends RefCounted
 ## Раньше порядок был обратный, и магистраль одного района упиралась в торец дома
 ## соседнего: сетки у районов разные и друг о друге они не знали.
 ##
+## Входы (`entrances`) выдаются НЕ только локациям атласа, но и каждому
+## рядовом дому ближнего чанка: именно по ним `CityGenerator` открывает
+## интерьеры, когда игрок подходит к подъезду.
+##
 ## Детерминизм: всё зависит только от (city_seed, координаты чанка).
 ## Бесшовность: квартал обрабатывает тот чанк, в который попал его центр.
 
@@ -27,6 +31,9 @@ const PODIUM_MIN_HEIGHT := 26.0   ## от какого дома имеет см�
 const PODIUM_CHANCE := 0.62
 const ROAD_OVERRUN := 26.0        ## насколько магистраль выходит за границу района
 const CORRIDOR_MARGIN := 1.4      ## зазор между кромкой асфальта и стеной
+## Меньше этого дом не получает подъезда: внутри не помещается ни коридор,
+## ни лестница — это трансформаторная будка, а не здание.
+const ENTERABLE_MIN_SIDE := 7.5
 
 ## Габариты landmark'ов по типу локации (метры).
 const LANDMARK_FOOTPRINT: Dictionary = {
@@ -213,6 +220,34 @@ static func _fill_block(block: Rect2, district: Dictionary, result: Dictionary, 
 		_add_signs(building, district, result)
 		if detail_level == 0:
 			_add_props(building, district, result)
+			# Подъезд рядового дома. Стилобат важнее башни: вход всегда
+			# в нижний объём, и именно он задаёт габариты интерьера.
+			_add_entrance(podium if not podium.is_empty() else building, result)
+
+
+## Вход в рядовой дом. Идентификатор строится от координат, поэтому устойчив
+## между пересборками чанка: игрок вышел и вернулся — квартиры те же.
+static func _add_entrance(building: Dictionary, result: Dictionary) -> void:
+	var size: Vector3 = building["size"]
+	if size.x < ENTERABLE_MIN_SIDE or size.z < ENTERABLE_MIN_SIDE:
+		return
+
+	var center: Vector3 = building["center"]
+	var floors: int = maxi(1, int(building.get("floors", 1)))
+	var interior_id: String = "bld_%d_%d" % [int(round(center.x * 4.0)), int(round(center.z * 4.0))]
+
+	(result["entrances"] as Array).append({
+		"location_id": interior_id,
+		# Точка перед фасадом: именно от неё считается радиус открытия.
+		"position": Vector3(center.x, 0.0, center.z + size.z * 0.5 + 1.2),
+		"origin": Vector2(center.x, center.z),
+		"footprint": Vector2(size.x, size.z),
+		"floors": floors,
+		"kind": -1,
+		"lock_level": 0,
+		"has_camera": false,
+		"atlas": false,
+	})
 
 
 ## Обрезка участка от дорожных коридоров. Отрезаем только то, что торчит
@@ -451,10 +486,14 @@ static func _place_atlas_locations(chunk_rect: Rect2, result: Dictionary, reserv
 		(result["entrances"] as Array).append({
 			"location_id": location_id,
 			"position": Vector3(position.x, 0.0, position.y + footprint.y * 0.5 + 1.2),
+			"origin": position,
+			"footprint": footprint,
 			"kind": kind,
 			"lock_level": int(loc["lock_level"]),
 			"has_camera": bool(loc["has_camera"]),
 			"floors": floors,
+			# Сюжетный адрес: интерьер строится по данным атласа.
+			"atlas": true,
 		})
 
 		_add_signs(building, district, result, true)
