@@ -13,10 +13,22 @@ extends RefCounted
 ##   • продолжение застройки вплотную за границей — плотно, с уступами;
 ##   • псевдо-окраины — зданий значительно меньше, они низкие и широкие;
 ##   • горизонт — редкие острова башен, уходящие в туман.
+##
+## ПОЧЕМУ ЗДЕСЬ БЫЛИ «ФАНТОМНЫЕ ОКНА». Две причины, обе закрыты:
+##   1. внутренний силуэт включался на фиксированных 780 метрах, а стриминг
+##      при высоких пресетах грузит чанки на 1500-1900. Грубые кубы кварталов
+##      проступали поверх настоящих домов и висели окнами в воздухе там,
+##      где реальной застройки в квартале не оказалось. Теперь дистанция
+##      задаётся снаружи (см. [method build] и [method set_fade_begin]) и всегда
+##      больше фактического радиуса чанков;
+##   2. светящиеся ленты заглушки были ярче самих коробок и торчали над
+##      гранью. Ночью тёмный корпус сливался с небом, а лента оставалась —
+##      ровно эффект «окно без здания». Теперь ленты утоплены в грань,
+##      слабее по энергии и гаснут по дистанции раньше, чем корпус.
 
 const TILE_SIZE := 960.0            ## сторона супер-плитки в метрах
-const FADE_BEGIN := 780.0           ## с какой дистанции включается внутренний силуэт
-const FADE_MARGIN := 220.0
+const FADE_BEGIN := 1400.0          ## запасная дистанция, если снаружи ничего не задали
+const FADE_MARGIN := 260.0
 const MIN_TILE_INSTANCES := 1
 const FLOOR_HEIGHT := 3.4
 
@@ -30,6 +42,9 @@ const OUTER_H_MAX := 82.0
 const OUTER_TOWER_H := 235.0        ## высота кластерных высоток
 const OUTER_MAX_PARTS := 1600       ## лимит масс на плитку
 const OUTER_STRIPES := 220          ## лимит светящихся элементов на плитку
+## Ленты гаснут раньше корпусов: иначе на пределе видимости остаются
+## светящиеся полоски без зданий.
+const GLOW_VISIBLE_TO := 2600.0
 
 ## Границы поясов в долях OUTER_MARGIN.
 const BELT_CITY := 0.22             ## до этого — продолжение города
@@ -39,10 +54,13 @@ static var _flat: StandardMaterial3D = null
 static var _glow: StandardMaterial3D = null
 
 
-static func build() -> Node3D:
+## [param fade_begin] — с какой дистанции проявляется внутренний силуэт.
+## Генератор передаёт сюда реальный радиус стриминга плюс запас.
+static func build(fade_begin: float = FADE_BEGIN) -> Node3D:
 	var root := Node3D.new()
 	root.name = "FarField"
 
+	var begin: float = maxf(320.0, fade_begin)
 	var bounds: Rect2 = CityAtlas.world_bounds()
 	var tiles_x: int = int(ceil(bounds.size.x / TILE_SIZE))
 	var tiles_y: int = int(ceil(bounds.size.y / TILE_SIZE))
@@ -59,7 +77,7 @@ static func build() -> Node3D:
 			if blocks.size() < MIN_TILE_INSTANCES:
 				continue
 
-			var node: MultiMeshInstance3D = _make_tile(blocks, "FarTile_%d_%d" % [tx, ty])
+			var node: MultiMeshInstance3D = _make_tile(blocks, "FarTile_%d_%d" % [tx, ty], begin)
 			root.add_child(node)
 			total_instances += blocks.size()
 
@@ -69,9 +87,26 @@ static func build() -> Node3D:
 		"плиток": root.get_child_count(),
 		"силуэтов": total_instances,
 		"заглушка": outer,
+		"силуэт_с_м": int(begin),
 		"мс": int((Time.get_ticks_usec() - started) / 1000),
 	})
 	return root
+
+
+## Меняет дистанцию появления внутреннего силуэта на лету. Вызывается
+## при смене графического пресета: радиус стриминга там меняется в разы.
+static func set_fade_begin(root: Node3D, fade_begin: float) -> void:
+	if root == null or not is_instance_valid(root):
+		return
+	var begin: float = maxf(320.0, fade_begin)
+	for child: Node in root.get_children():
+		if not (child is MultiMeshInstance3D):
+			continue
+		if not child.name.begins_with("FarTile_"):
+			continue
+		var node: MultiMeshInstance3D = child as MultiMeshInstance3D
+		node.visibility_range_begin = begin
+		node.visibility_range_begin_margin = FADE_MARGIN
 
 
 ## Один куб на квартал: та же сетка, что у настоящей застройки, но без
@@ -143,7 +178,7 @@ static func _coarse_blocks(tile: Rect2) -> Array[Dictionary]:
 	return out
 
 
-static func _make_tile(blocks: Array[Dictionary], node_name: String) -> MultiMeshInstance3D:
+static func _make_tile(blocks: Array[Dictionary], node_name: String, fade_begin: float) -> MultiMeshInstance3D:
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.use_colors = true
@@ -162,7 +197,7 @@ static func _make_tile(blocks: Array[Dictionary], node_name: String) -> MultiMes
 	node.multimesh = mm
 	node.material_override = CityMaterials.facade_far
 	node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	node.visibility_range_begin = FADE_BEGIN
+	node.visibility_range_begin = fade_begin
 	node.visibility_range_begin_margin = FADE_MARGIN
 	node.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
 	return node
@@ -181,6 +216,9 @@ static func flat_material() -> StandardMaterial3D:
 	mat.metallic = 0.0
 	mat.specular_mode = BaseMaterial3D.SPECULAR_DISABLED
 	mat.vertex_color_use_as_albedo = true
+	# Заглушка не освещается сценой: ночью направленного света почти нет,
+	# и корпуса уходили в чистый чёрный, оставляя на виду одни ленты.
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	mat.cull_mode = BaseMaterial3D.CULL_BACK
 	_flat = mat
 	return _flat
@@ -195,7 +233,8 @@ static func glow_material() -> StandardMaterial3D:
 	mat.vertex_color_use_as_albedo = true
 	mat.emission_enabled = true
 	mat.emission = Color(1.0, 1.0, 1.0)
-	mat.emission_energy_multiplier = 1.6
+	# Было 1.6 — ленты пересвечивали корпуса и читались отдельно от них.
+	mat.emission_energy_multiplier = 0.85
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	mat.specular_mode = BaseMaterial3D.SPECULAR_DISABLED
 	_glow = mat
@@ -260,6 +299,10 @@ static func _build_outer(root: Node3D, bounds: Rect2) -> int:
 			glow.multimesh = gm
 			glow.material_override = glow_material()
 			glow.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			# Гаснут раньше корпусов — «окон без зданий» на горизонте больше нет.
+			glow.visibility_range_end = GLOW_VISIBLE_TO
+			glow.visibility_range_end_margin = GLOW_VISIBLE_TO * 0.2
+			glow.visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
 			root.add_child(glow)
 
 	return total
@@ -276,9 +319,10 @@ static func _outer_blocks(tile: Rect2, bounds: Rect2) -> Array[Dictionary]:
 	var j_to: int = int(ceil(tile.end.y / OUTER_PITCH))
 	var seed_value: int = CityAtlas.city_seed
 
-	# Оттенки поясов: ближе — городской бетон, дальше — выцветающий туман.
-	var near_tone := Color(0.115, 0.128, 0.164)
-	var far_tone := Color(0.062, 0.072, 0.104)
+	# Оттенки поясов. Подняты: раньше корпуса были темнее ночного неба и
+	# визуально исчезали, оставляя висеть в воздухе одни светящиеся ленты.
+	var near_tone := Color(0.168, 0.183, 0.226)
+	var far_tone := Color(0.098, 0.110, 0.150)
 
 	for i: int in range(i_from, i_to + 1):
 		for j: int in range(j_from, j_to + 1):
@@ -341,7 +385,7 @@ static func _outer_blocks(tile: Rect2, bounds: Rect2) -> Array[Dictionary]:
 			var side_z: float = side_x * (0.72 + 0.5 * _hash01(i * 374761393 + j * 668265263))
 			var tone: Color = near_tone.lerp(far_tone, away)
 			# Микроразнобой тона: даже без текстур застройка не читается заливкой.
-			tone = tone * (0.82 + 0.36 * shape)
+			tone = tone * (0.85 + 0.34 * shape)
 			var is_tower: bool = height > 95.0
 
 			out.append({
@@ -398,6 +442,9 @@ static func _outer_blocks(tile: Rect2, bounds: Rect2) -> Array[Dictionary]:
 
 ## Светящиеся элементы: оконные ленты на ближних домах, вертикальные
 ## полосы на высотках и красные маячки на шпилях.
+##
+## Все ленты утоплены в грань (0.49 полуразмера, а не 0.51): торчащая наружу
+## полоска на дальней дистанции отрывалась от корпуса и висела в воздухе.
 static func _outer_stripes(masses: Array[Dictionary]) -> Array[Dictionary]:
 	var out: Array[Dictionary] = []
 	var cold := Color(0.30, 0.72, 1.0)
@@ -421,9 +468,9 @@ static func _outer_stripes(masses: Array[Dictionary]) -> Array[Dictionary]:
 			for r: int in range(rows):
 				var t: float = (float(r) + 1.0) / (float(rows) + 1.0)
 				out.append({
-					"center": Vector3(center.x, center.y - box_size.y * 0.5 + box_size.y * t, center.z + box_size.z * 0.51),
-					"size": Vector3(box_size.x * 0.78, 0.55, 0.25),
-					"tint": window_tone * (0.55 + 0.45 * shape),
+					"center": Vector3(center.x, center.y - box_size.y * 0.5 + box_size.y * t, center.z + box_size.z * 0.49),
+					"size": Vector3(box_size.x * 0.74, 0.5, 0.12),
+					"tint": window_tone * (0.45 + 0.4 * shape),
 				})
 
 		if height < 46.0:
@@ -435,15 +482,15 @@ static func _outer_stripes(masses: Array[Dictionary]) -> Array[Dictionary]:
 		# Две полосы на противоположных гранях — силуэт читается с любого ракурса.
 		for k: float in [-1.0, 1.0]:
 			out.append({
-				"center": Vector3(center.x, center.y, center.z + k * box_size.z * 0.51),
-				"size": Vector3(box_size.x * 0.14, box_size.y * 0.82, 0.4),
+				"center": Vector3(center.x, center.y, center.z + k * box_size.z * 0.49),
+				"size": Vector3(box_size.x * 0.12, box_size.y * 0.8, 0.16),
 				"tint": tint,
 			})
 
 		if bool(block.get("tower", false)):
 			out.append({
-				"center": Vector3(center.x, height + 2.2, center.z),
-				"size": Vector3(1.7, 1.7, 1.7),
+				"center": Vector3(center.x, height + 1.4, center.z),
+				"size": Vector3(1.5, 1.5, 1.5),
 				"tint": beacon,
 			})
 
