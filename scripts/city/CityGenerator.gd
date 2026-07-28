@@ -19,11 +19,17 @@ extends Node3D
 ##
 ## Уровни детализации назначаются по расстоянию в чанках и пересобираются
 ## на лету, когда игрок приближается или отдаляется.
+##
+## Интерьеры: войти можно в ЛЮБОЕ здание ближнего кольца, а не только в
+## сюжетные адреса атласа. Генератор хранит полную запись входа
+## (габариты, этажность, центр дома) и передаёт её фабрике интерьеров.
 
 const CHUNK_SIZE_DEFAULT := 240.0
 const DETAIL_NEAR_CHUNKS := 1
 const DETAIL_MID_CHUNKS := 3
-const MAX_INTERIORS := 4
+## Сколько интерьеров держим одновременно. На плотной улице в радиус 26 м
+## попадает до шести подъездов — меньший лимит заставлял бы их моргать.
+const MAX_INTERIORS := 6
 const INTERIOR_ENTER_RADIUS := 26.0
 const INTERIOR_RELEASE_RADIUS := 55.0
 const INTERIOR_CHECK_INTERVAL := 0.25
@@ -39,6 +45,10 @@ const FURNITURE_UNLOAD_RADIUS := 48.0
 const OCCLUSION_RAYS_PER_THREAD := 32
 ## Качество BVH окклюдеров: 0 = LOW, 1 = MEDIUM, 2 = HIGH.
 const OCCLUSION_BVH_QUALITY := 2
+## Запас между краем реальной застройки и началом силуэтной заглушки,
+## в чанках. Без него грубые кубы дальнего поля проступают поверх реальных
+## домов — и игрок видит висящие в воздухе «фантомные окна» без зданий.
+const FAR_FIELD_MARGIN_CHUNKS := 1.6
 
 signal chunk_built(coords: Vector2i, build_ms: int)
 signal chunk_released(coords: Vector2i)
@@ -72,13 +82,17 @@ var _release_queue: Array[Vector2i] = []
 var _grid_size: Vector2i = Vector2i.ZERO
 var _grid_origin: Vector2 = Vector2.ZERO
 
-var _entrances: Dictionary = {}       # location_id -> Vector3
+var _entrances: Dictionary = {}       # location_id -> полная запись входа (Dictionary)
 var _interiors: Dictionary = {}       # location_id -> Node3D
 var _interior_order: Array[String] = []
 var _interior_timer: float = 0.0
+## Адреса, для которых интерьер построить не вышло (слишком тесно и т.п.).
+## Без этого списка генератор пытался бы строить их каждые 0.25 с.
+var _interior_failed: Dictionary = {}
 
 var _river: Node3D = null
 var _far_field: Node3D = null
+var _far_fade_radius: int = -1
 var _chunk_root: Node3D = null
 var _interior_root: Node3D = null
 
@@ -108,7 +122,10 @@ func _ready() -> void:
 	add_child(_river)
 
 	# Дальнее поле строится один раз и покрывает всю карту силуэтами.
-	_far_field = NoirCityFarField.build()
+	# Границу появления заглушки задаёт текущий радиус стриминга,
+	# иначе на высоких пресетах она лезет внутрь реального города.
+	_far_fade_radius = _stream_radius()
+	_far_field = NoirCityFarField.build(_far_fade_distance())
 	add_child(_far_field)
 
 	var bounds: Rect2 = CityAtlas.world_bounds()
@@ -126,7 +143,14 @@ func _ready() -> void:
 		"всего_чанков": _grid_size.x * _grid_size.y,
 		"бюджет_мс": build_budget_ms,
 		"окклюзия": use_occlusion_culling,
+		"заглушка_от_м": _far_fade_distance(),
 	})
+
+
+## Расстояние, с которого разрешено показывать силуэтную заглушку.
+func _far_fade_distance() -> float:
+	var radius: float = float(maxi(1, _far_fade_radius))
+	return (radius + FAR_FIELD_MARGIN_CHUNKS) * chunk_size
 
 
 ## ФАЗА 4. Отсечение невидимого. Громадные здания ставят окклюдеры
@@ -312,6 +336,13 @@ func _update_streaming() -> void:
 	var radius: int = _stream_radius()
 	var total: int = radius + _hide_ring()
 
+	# Радиус меняется вместе с графическим пресетом — заглушка дальнего
+	# плана обязана отъехать за новую границу реальной застройки.
+	if radius != _far_fade_radius:
+		_far_fade_radius = radius
+		if _far_field != null and is_instance_valid(_far_field):
+			NoirCityFarField.set_fade_begin(_far_field, _far_fade_distance())
+
 	var wanted: Dictionary = {}
 	_hidden_wanted.clear()
 	for dx: int in range(-total, total + 1):
@@ -469,10 +500,32 @@ func _release_chunk(coords: Vector2i) -> void:
 	chunk_released.emit(coords)
 
 
+## Запись входа сохраняется целиком: фабрике интерьеров нужны габариты
+## и этажность дома, а не только точка двери.
 func _reindex_entrances(chunk: NoirCityChunk) -> void:
 	for entry: Variant in chunk.entrances():
 		var data: Dictionary = entry as Dictionary
-		_entrances[str(data["location_id"])] = data["position"]
+		if data == null or data.is_empty():
+			continue
+		var location_id: String = str(data.get("location_id", ""))
+		if location_id.is_empty():
+			continue
+		if _interior_failed.has(location_id):
+			continue
+		_entrances[location_id] = data
+
+
+## Точка двери по идентификатору. Возвращает `false` во втором элементе,
+## если входа больше нет (чанк выгрузился).
+func _entrance_position(location_id: String) -> Array:
+	var raw: Variant = _entrances.get(location_id, null)
+	if not (raw is Dictionary):
+		return [Vector3.ZERO, false]
+	var data: Dictionary = raw as Dictionary
+	var position: Variant = data.get("position", null)
+	if not (position is Vector3):
+		return [Vector3.ZERO, false]
+	return [position as Vector3, true]
 
 
 # ---------------------------------------------------------------- интерьеры
@@ -481,24 +534,36 @@ func _update_interiors() -> void:
 	if _entrances.is_empty():
 		return
 
-	# Открываем интерьер здания, к которому подошли вплотную.
+	# Открываем интерьер здания, к которому подошли вплотную. Если рядом
+	# сразу несколько подъездов, берём ближайшие: лимит MAX_INTERIORS
+	# должен тратиться на те дома, в которые игрок реально может войти.
+	var candidates: Array[Dictionary] = []
 	for key: Variant in _entrances.keys():
 		var location_id: String = str(key)
 		if _interiors.has(location_id):
 			continue
-		var entrance: Vector3 = _entrances[key]
-		if _observer_position.distance_to(entrance) <= INTERIOR_ENTER_RADIUS:
-			_open_interior(location_id)
+		var found: Array = _entrance_position(location_id)
+		if not bool(found[1]):
+			continue
+		var distance: float = _observer_position.distance_to(found[0] as Vector3)
+		if distance <= INTERIOR_ENTER_RADIUS:
+			candidates.append({"id": location_id, "distance": distance})
+
+	candidates.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return float(a["distance"]) < float(b["distance"])
+	)
+	for candidate: Dictionary in candidates:
+		_open_interior(str(candidate["id"]))
 
 	# Закрываем то, от чего отошли.
 	var to_close: Array[String] = []
 	for key: Variant in _interiors.keys():
 		var location_id: String = str(key)
-		var entrance: Variant = _entrances.get(location_id, null)
-		if entrance == null:
+		var found: Array = _entrance_position(location_id)
+		if not bool(found[1]):
 			to_close.append(location_id)
 			continue
-		if _observer_position.distance_to(entrance as Vector3) > INTERIOR_RELEASE_RADIUS:
+		if _observer_position.distance_to(found[0] as Vector3) > INTERIOR_RELEASE_RADIUS:
 			to_close.append(location_id)
 	for location_id: String in to_close:
 		_close_interior(location_id)
@@ -517,10 +582,10 @@ func _update_interior_detail() -> void:
 		if not (node is Node3D) or not is_instance_valid(node as Node3D):
 			continue
 		var interior: Node3D = node as Node3D
-		var entrance: Variant = _entrances.get(location_id, null)
-		if entrance == null:
+		var found: Array = _entrance_position(location_id)
+		if not bool(found[1]):
 			continue
-		var distance: float = _observer_position.distance_to(entrance as Vector3)
+		var distance: float = _observer_position.distance_to(found[0] as Vector3)
 
 		if distance > FURNITURE_UNLOAD_RADIUS:
 			NoirInteriorFactory.unload_furniture(interior)
@@ -529,12 +594,20 @@ func _update_interior_detail() -> void:
 
 
 func _open_interior(location_id: String) -> void:
+	if _interiors.has(location_id) or _interior_failed.has(location_id):
+		return
+
+	var raw: Variant = _entrances.get(location_id, null)
+	if not (raw is Dictionary):
+		return
+
 	while _interior_order.size() >= MAX_INTERIORS:
 		_close_interior(_interior_order[0])
 
-	var node: Node3D = NoirInteriorFactory.build(location_id)
+	var node: Node3D = NoirInteriorFactory.build_for(raw as Dictionary)
 	if node == null:
-		# Помечаем, чтобы не пытаться строить снова каждые 0.25 с.
+		# Запоминаем отказ, чтобы не пытаться строить снова каждые 0.25 с.
+		_interior_failed[location_id] = true
 		_entrances.erase(location_id)
 		return
 
@@ -557,6 +630,7 @@ func _close_interior(location_id: String) -> void:
 func open_interior_now(location_id: String) -> Node3D:
 	if _interiors.has(location_id):
 		return _interiors[location_id]
+	_interior_failed.erase(location_id)
 	_open_interior(location_id)
 	var node: Variant = _interiors.get(location_id, null)
 	return node as Node3D if node is Node3D else null
