@@ -7,15 +7,21 @@ extends RefCounted
 ## Превращением данных в MultiMesh занимается `CityChunk`.
 ##
 ## Порядок работы важен и устроен так:
-##   1. резерв под landmark'и атласа;
+##   1. резерв под landmark'и атласа, включая соседние чанки;
 ##   2. **сначала дороги** всех районов чанка, включая зоны-заполнители;
 ##   3. и только потом застройка, которая обязана обходить дорожные коридоры.
-## Раньше порядок был обратный, и магистраль одного района упиралась в торец дома
-## соседнего: сетки у районов разные и друг о друге они не знали.
+##
+## Три правила, без которых город расползается:
+##   • коридор резервируется под КАЖДУЮ улицу сетки, а не только под
+##     магистраль — иначе кварталы соседнего района садятся прямо на асфальт;
+##   • участок обрезается по границе своей зоны — иначе кварталы разных
+##     районов и синтетических заполнителей врастают друг в друга;
+##   • занятые пятна резервируются с зазором и проверяются уже ПОСЛЕ обрезки.
 ##
 ## Входы (`entrances`) выдаются НЕ только локациям атласа, но и каждому
-## рядовом дому ближнего чанка: именно по ним `CityGenerator` открывает
-## интерьеры, когда игрок подходит к подъезду.
+## рядовому дому ближнего чанка. Вход — это не только точка: дом получает
+## крыльцо с козырьком и лампой, а его коллизия в `CityChunk` собирается
+## оболочкой с проёмом, так что внутрь можно банально войти пешком.
 ##
 ## Детерминизм: всё зависит только от (city_seed, координаты чанка).
 ## Бесшовность: квартал обрабатывает тот чанк, в который попал его центр.
@@ -34,6 +40,14 @@ const CORRIDOR_MARGIN := 1.4      ## зазор между кромкой асф
 ## Меньше этого дом не получает подъезда: внутри не помещается ни коридор,
 ## ни лестница — это трансформаторная будка, а не здание.
 const ENTERABLE_MIN_SIDE := 7.5
+## Габариты входного проёма. Те же значения читает `CityChunk`, когда
+## собирает коллизию-оболочку: дыра в физике обязана совпасть с крыльцом.
+const DOOR_WIDTH := 2.6
+const DOOR_HEIGHT := 3.0
+const PORCH_DEPTH := 1.5
+## Зазор вокруг занятого пятна. Без него два дома стоят вплотную и на экране
+## выглядят одним слипшимся объёмом.
+const PLOT_CLEARANCE := 0.5
 
 ## Габариты landmark'ов по типу локации (метры).
 const LANDMARK_FOOTPRINT: Dictionary = {
@@ -83,6 +97,9 @@ static func generate(chunk_rect: Rect2, city_seed: int, detail_level: int) -> Di
 	# Landmark'и ставим первыми: обычная застройка обязана их обойти.
 	var reserved: Array[Rect2] = []
 	_place_atlas_locations(chunk_rect, result, reserved, rng, detail_level)
+	# Сюжетные здания соседних чанков тоже занимают место. Без этого дом
+	# у границы чанка врастал в отель, стоящий в двадцати метрах за ней.
+	_reserve_neighbor_landmarks(chunk_rect, reserved)
 
 	# Полный список зон чанка: реальные районы + синтетические заполнители
 	# пустырей между ними.
@@ -189,16 +206,28 @@ static func _fill_block(block: Rect2, district: Dictionary, result: Dictionary, 
 	if rng.randf() > density + 0.12:
 		return  # пустырь или парковка — город не должен быть сплошной стеной
 
+	var zone_bounds: Rect2 = district["bounds"]
 	var lots: Array[Rect2] = _subdivide(block, district, rng)
 	for lot: Rect2 in lots:
 		if lot.size.x < MIN_LOT or lot.size.y < MIN_LOT:
 			continue
-		if _overlaps_any(lot, reserved):
-			continue
-		# Главная проверка против тупиков: если участок залез на чужую улицу,
-		# пробуем его обрезать, а если обрезок слишком мал — не строим вовсе.
-		var plot: Rect2 = _clip_from_roads(lot, corridors)
+
+		# 1. Участок не имеет права выходить за границу своей зоны: сетки
+		# районов не согласованы между собой, и именно здесь рождались
+		# здания, вросшие одно в другое на стыке кварталов.
+		var plot: Rect2 = lot.intersection(zone_bounds)
 		if plot.size.x < MIN_LOT or plot.size.y < MIN_LOT:
+			continue
+
+		# 2. Улицы важнее домов: если участок залез на асфальт, обрезаем,
+		# а если обрезок мал — не строим вовсе.
+		plot = _clip_from_roads(plot, corridors)
+		if plot.size.x < MIN_LOT or plot.size.y < MIN_LOT:
+			continue
+
+		# 3. И только теперь проверяем занятость — по итоговому пятну,
+		# а не по исходному участку, как было раньше.
+		if _overlaps_any(plot.grow(PLOT_CLEARANCE * 0.8), reserved):
 			continue
 		if _lot_in_river(plot):
 			continue
@@ -215,39 +244,157 @@ static func _fill_block(block: Rect2, district: Dictionary, result: Dictionary, 
 		(result["buildings"] as Array).append(building)
 		if not podium.is_empty():
 			(result["buildings"] as Array).append(podium)
-		reserved.append(plot)
+		reserved.append(plot.grow(PLOT_CLEARANCE))
 
 		_add_signs(building, district, result)
 		if detail_level == 0:
 			_add_props(building, district, result)
 			# Подъезд рядового дома. Стилобат важнее башни: вход всегда
 			# в нижний объём, и именно он задаёт габариты интерьера.
-			_add_entrance(podium if not podium.is_empty() else building, result)
+			_add_entrance(podium if not podium.is_empty() else building, result, corridors)
 
 
-## Вход в рядовой дом. Идентификатор строится от координат, поэтому устойчив
-## между пересборками чанка: игрок вышел и вернулся — квартиры те же.
-static func _add_entrance(building: Dictionary, result: Dictionary) -> void:
+# -------------------------------------------------------------------- подъезды
+
+## Вход в дом. Делает три вещи:
+##   • помечает дом проходимым — `CityChunk` соберёт ему оболочку с проёмом;
+##   • ставит крыльцо с козырьком и лампой, чтобы вход было видно с улицы;
+##   • записывает данные для фабрики интерьеров.
+## Идентификатор строится от координат, поэтому устойчив между пересборками
+## чанка: игрок вышел и вернулся — квартиры те же.
+static func _add_entrance(building: Dictionary, result: Dictionary, corridors: Array[Rect2]) -> void:
 	var size: Vector3 = building["size"]
 	if size.x < ENTERABLE_MIN_SIDE or size.z < ENTERABLE_MIN_SIDE:
 		return
 
 	var center: Vector3 = building["center"]
 	var floors: int = maxi(1, int(building.get("floors", 1)))
+	var side: int = _street_side(center, size, corridors)
+	var normal: Vector3 = _side_normal(side)
+	var half: float = size.x * 0.5 if absf(normal.x) > 0.5 else size.z * 0.5
+	var door_point: Vector3 = Vector3(center.x, 0.0, center.z) + normal * (half + PORCH_DEPTH + 0.4)
 	var interior_id: String = "bld_%d_%d" % [int(round(center.x * 4.0)), int(round(center.z * 4.0))]
+
+	building["enterable"] = true
+	building["door_side"] = side
+	_add_porch(building, side, result)
 
 	(result["entrances"] as Array).append({
 		"location_id": interior_id,
-		# Точка перед фасадом: именно от неё считается радиус открытия.
-		"position": Vector3(center.x, 0.0, center.z + size.z * 0.5 + 1.2),
+		# Точка перед крыльцом: именно от неё считается радиус открытия.
+		"position": door_point,
 		"origin": Vector2(center.x, center.z),
 		"footprint": Vector2(size.x, size.z),
 		"floors": floors,
+		"door_side": side,
 		"kind": -1,
 		"lock_level": 0,
 		"has_camera": false,
 		"atlas": false,
 	})
+
+
+## Крыльцо: две боковые стенки, козырёк, ступень и лампа над проёмом.
+## Коллизий у крыльца нет намеренно — сквозь него игрок и заходит внутрь.
+static func _add_porch(building: Dictionary, side: int, result: Dictionary) -> void:
+	var size: Vector3 = building["size"]
+	var center: Vector3 = building["center"]
+	var normal: Vector3 = _side_normal(side)
+	var tangent := Vector3(normal.z, 0.0, normal.x)
+	var along_x: bool = absf(normal.x) > 0.5
+	var half: float = size.x * 0.5 if along_x else size.z * 0.5
+	var face: Vector3 = Vector3(center.x, 0.0, center.z) + normal * half
+	var width: float = DOOR_WIDTH + 1.0
+	var thickness: float = 0.3
+	var wall_height: float = DOOR_HEIGHT + 0.2
+
+	for s: int in [-1, 1]:
+		var pos: Vector3 = face + normal * (PORCH_DEPTH * 0.5) + tangent * (float(s) * width * 0.5)
+		var wall_size: Vector3 = (
+			Vector3(PORCH_DEPTH, wall_height, thickness) if along_x
+			else Vector3(thickness, wall_height, PORCH_DEPTH)
+		)
+		(result["props"] as Array).append({
+			"transform": Transform3D(Basis.IDENTITY.scaled(wall_size), Vector3(pos.x, wall_height * 0.5, pos.z)),
+			"kind": "porch_wall",
+		})
+
+	# Козырёк над входом.
+	var canopy_size: Vector3 = (
+		Vector3(PORCH_DEPTH + 0.5, 0.26, width + 0.6) if along_x
+		else Vector3(width + 0.6, 0.26, PORCH_DEPTH + 0.5)
+	)
+	var canopy_pos: Vector3 = face + normal * (PORCH_DEPTH * 0.5)
+	(result["props"] as Array).append({
+		"transform": Transform3D(
+			Basis.IDENTITY.scaled(canopy_size),
+			Vector3(canopy_pos.x, DOOR_HEIGHT + 0.38, canopy_pos.z)
+		),
+		"kind": "porch_canopy",
+	})
+
+	# Ступень перед проёмом.
+	var step_size: Vector3 = (
+		Vector3(1.2, 0.18, width + 0.4) if along_x
+		else Vector3(width + 0.4, 0.18, 1.2)
+	)
+	var step_pos: Vector3 = face + normal * (PORCH_DEPTH + 0.55)
+	(result["props"] as Array).append({
+		"transform": Transform3D(Basis.IDENTITY.scaled(step_size), Vector3(step_pos.x, 0.09, step_pos.z)),
+		"kind": "porch_step",
+	})
+
+	# Лампа над дверью: главный ориентир ночью — по ней вход и находят.
+	var lamp_basis := Basis.looking_at(-normal, Vector3.UP).scaled(Vector3(width * 0.7, 0.34, 1.0))
+	var lamp_pos: Vector3 = face + normal * (PORCH_DEPTH + 0.06) + Vector3(0.0, DOOR_HEIGHT + 0.66, 0.0)
+	(result["signs"] as Array).append({
+		"transform": Transform3D(lamp_basis, lamp_pos),
+		"tint": CityAtlas.palette("window_warm"),
+		"custom": Color(0.31, 0.95, 0.0, 0.0),
+	})
+
+
+## Сторона, обращённая к улице: 0 = +X, 1 = -X, 2 = +Z, 3 = -Z.
+## Вход всегда смотрит на ближайший дорожный коридор, иначе дверь упирается
+## в стену соседнего дома.
+static func _street_side(center: Vector3, size: Vector3, corridors: Array[Rect2]) -> int:
+	var best: int = 2
+	var best_distance: float = INF
+	for side: int in range(4):
+		var normal: Vector3 = _side_normal(side)
+		var half: float = size.x * 0.5 if absf(normal.x) > 0.5 else size.z * 0.5
+		var probe := Vector2(
+			center.x + normal.x * (half + 3.5),
+			center.z + normal.z * (half + 3.5)
+		)
+		var distance: float = INF
+		for corridor: Rect2 in corridors:
+			distance = minf(distance, _rect_distance(corridor, probe))
+			if distance <= 0.0:
+				break
+		if distance < best_distance:
+			best_distance = distance
+			best = side
+	return best
+
+
+static func _side_normal(side: int) -> Vector3:
+	match side:
+		0:
+			return Vector3.RIGHT
+		1:
+			return Vector3.LEFT
+		2:
+			return Vector3.BACK
+		_:
+			return Vector3.FORWARD
+
+
+## Расстояние от точки до прямоугольника. Внутри прямоугольника — ноль.
+static func _rect_distance(rect: Rect2, point: Vector2) -> float:
+	var dx: float = maxf(maxf(rect.position.x - point.x, 0.0), point.x - rect.end.x)
+	var dy: float = maxf(maxf(rect.position.y - point.y, 0.0), point.y - rect.end.y)
+	return sqrt(dx * dx + dy * dy)
 
 
 ## Обрезка участка от дорожных коридоров. Отрезаем только то, что торчит
@@ -305,6 +452,9 @@ static func _make_podium(building: Dictionary, district: Dictionary) -> Dictiona
 
 	building["size"] = Vector3(tower_lot.size.x, height, tower_lot.size.y)
 	building["rect"] = tower_lot
+	# Башня не должна закупоривать стилобат изнутри: её коллизия начинается
+	# там, где заканчивается нижний объём, иначе внутрь не войти.
+	building["collision_from_y"] = podium_height
 
 	var tint: Color = building["tint"]
 	var custom: Color = building["custom"]
@@ -483,15 +633,25 @@ static func _place_atlas_locations(chunk_rect: Rect2, result: Dictionary, reserv
 			(result["buildings"] as Array).append(podium)
 		reserved.append(lot.grow(2.0))
 
+		# Сюжетное здание тоже должно открываться пешком, а не по сценарию:
+		# вход всегда со стороны +Z, там же стоит крыльцо.
+		var host: Dictionary = podium if not podium.is_empty() else building
+		var host_size: Vector3 = host["size"]
+		if detail_level == 0 and host_size.x >= ENTERABLE_MIN_SIDE and host_size.z >= ENTERABLE_MIN_SIDE:
+			host["enterable"] = true
+			host["door_side"] = 2
+			_add_porch(host, 2, result)
+
 		(result["entrances"] as Array).append({
 			"location_id": location_id,
-			"position": Vector3(position.x, 0.0, position.y + footprint.y * 0.5 + 1.2),
+			"position": Vector3(position.x, 0.0, position.y + footprint.y * 0.5 + PORCH_DEPTH + 0.4),
 			"origin": position,
 			"footprint": footprint,
 			"kind": kind,
 			"lock_level": int(loc["lock_level"]),
 			"has_camera": bool(loc["has_camera"]),
 			"floors": floors,
+			"door_side": 2,
 			# Сюжетный адрес: интерьер строится по данным атласа.
 			"atlas": true,
 		})
@@ -499,6 +659,20 @@ static func _place_atlas_locations(chunk_rect: Rect2, result: Dictionary, reserv
 		_add_signs(building, district, result, true)
 		if detail_level == 0:
 			_add_props(building, district, result)
+
+
+## Резерв под сюжетные здания соседних чанков. Геометрию они получат в своём
+## чанке, здесь важно только не застроить их пятно.
+static func _reserve_neighbor_landmarks(chunk_rect: Rect2, reserved: Array[Rect2]) -> void:
+	for location_id: String in CityAtlas.locations_in_rect(chunk_rect.grow(60.0)):
+		var loc: Dictionary = CityAtlas.get_location(location_id)
+		if loc.is_empty():
+			continue
+		var position: Vector2 = loc["position"]
+		if chunk_rect.has_point(position):
+			continue
+		var footprint: Vector2 = LANDMARK_FOOTPRINT.get(int(loc["kind"]), Vector2(22.0, 18.0))
+		reserved.append(Rect2(position - footprint * 0.5, footprint).grow(2.0))
 
 
 # ---------------------------------------------------------------- вывески
@@ -720,6 +894,15 @@ static func _generate_roads(chunk_rect: Rect2, district: Dictionary, result: Dic
 	var i_from: int = int(floor((reach.position.x - bounds.position.x) / pitch))
 	var i_to: int = int(ceil((reach.end.x - bounds.position.x) / pitch))
 	for i: int in range(i_from, i_to + 1):
+		# Коридор обычной улицы: раньше застройка знала только про
+		# магистрали, поэтому кварталы соседнего района спокойно садились
+		# на рядовую улицу — дома стояли прямо на асфальте.
+		var lane_x: float = bounds.position.x + float(i) * pitch + block_size
+		var lane := Rect2(Vector2(lane_x, reach.position.y), Vector2(street, reach.size.y))
+		var lane_clip: Rect2 = lane.intersection(reach)
+		if lane_clip.size.x > 0.5 and lane_clip.size.y > 0.5:
+			corridors.append(lane_clip.grow(CORRIDOR_MARGIN * 0.5))
+
 		if i % ARTERIAL_EVERY != 0:
 			continue
 		var x: float = bounds.position.x + float(i) * pitch - street * 0.5
@@ -734,6 +917,12 @@ static func _generate_roads(chunk_rect: Rect2, district: Dictionary, result: Dic
 	var j_from: int = int(floor((reach.position.y - bounds.position.y) / pitch))
 	var j_to: int = int(ceil((reach.end.y - bounds.position.y) / pitch))
 	for j: int in range(j_from, j_to + 1):
+		var lane_z: float = bounds.position.y + float(j) * pitch + block_size
+		var lane := Rect2(Vector2(reach.position.x, lane_z), Vector2(reach.size.x, street))
+		var lane_clip: Rect2 = lane.intersection(reach)
+		if lane_clip.size.x > 0.5 and lane_clip.size.y > 0.5:
+			corridors.append(lane_clip.grow(CORRIDOR_MARGIN * 0.5))
+
 		if j % ARTERIAL_EVERY != 0:
 			continue
 		var z: float = bounds.position.y + float(j) * pitch - street * 0.5
