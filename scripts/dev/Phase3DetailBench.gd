@@ -1,18 +1,21 @@
 class_name NoirPhase3DetailBench
 extends Node3D
 ## Игровая сцена фаз 3-6: детализация зданий, наполнение улиц, стриминг,
-## окклюзия, графические пресеты и время суток.
+## окклюзия, графические пресеты, время суток, подземка и дождь.
 ##
 ## Управление: WASD — движение, мышь — обзор, Esc — пауза и настройки.
-## Горячие клавиши F1-F7 удалены: всё, что они делали, живёт в меню настроек.
 ##
 ## Свет, небо и туман считает [NoirSkyController]: сцена только сообщает ему
-## текущее время и настройки раздела «Мир».
+## текущее время и настройки раздела «Мир». Подземка ([NoirMetroBuilder])
+## и дождь ([NoirRainSystem]) собираются в рунтайме — .tscn править не надо.
 
 const HUD_INTERVAL := 0.25
 const PAUSE_MENU_SCENE := "res://scenes/ui/PauseMenu.tscn"
 
 @export var start_position: Vector3 = Vector3(-120.0, 24.0, 260.0)
+## Метро строится один раз при старте. На слабых машинах его можно выключить.
+@export var build_metro: bool = true
+@export var enable_rain: bool = true
 
 var _generator: NoirCityGenerator = null
 var _player: Node3D = null
@@ -21,6 +24,8 @@ var _menu: NoirSettingsMenu = null
 var _pause: NoirPauseMenu = null
 var _world_env: WorldEnvironment = null
 var _sun: DirectionalLight3D = null
+var _metro: Node3D = null
+var _rain: NoirRainSystem = null
 var _hud_timer: float = 0.0
 var _last_message: String = ""
 var _base_sun_energy: float = 1.0
@@ -60,6 +65,7 @@ func _ready() -> void:
 		Log.warn("Phase3Bench", "WorldEnvironment пуст — пресеты не управляют эффектами неба")
 
 	_setup_pause_menu()
+	_setup_world_systems()
 
 	_generator.chunk_built.connect(_on_chunk_built)
 	_generator.interior_opened.connect(_on_interior_opened)
@@ -105,6 +111,23 @@ func _setup_pause_menu() -> void:
 	if _menu != null:
 		_pause.set_settings_menu(_menu)
 	_pause.resumed.connect(_on_resumed)
+
+
+## Подземка и погода. Обе системы необязательны: если что-то пошло не так,
+## город всё равно запускается.
+func _setup_world_systems() -> void:
+	if build_metro:
+		if CityAtlas != null and CityAtlas.is_built():
+			_metro = NoirMetroBuilder.build()
+			if _metro != null:
+				add_child(_metro)
+		else:
+			Log.warn("Phase3Bench", "Атлас не готов — метро пропущено")
+
+	if enable_rain:
+		_rain = NoirRainSystem.new()
+		_rain.name = "RainSystem"
+		add_child(_rain)
 
 
 func _process(delta: float) -> void:
@@ -156,6 +179,8 @@ func _on_setting_changed(section_name: String, key: String, _value: Variant) -> 
 		return
 	if key == "exposure" or key == "night_brightness" or key == "time_of_day_min":
 		_apply_world_look()
+	elif key == "rain":
+		_last_message = "Дождь: %d%%" % int(round(GameConfig.get_float("world", "rain") * 100.0))
 
 
 func _on_resumed() -> void:
@@ -206,9 +231,10 @@ func _update_hud() -> void:
 		draw_calls, primitives, memory_mb,
 		"вкл" if bool(stats.get("occlusion", false)) else "выкл",
 	])
-	lines.append("Сложность: [b]%s[/b] — %s" % [
+	lines.append("Сложность: [b]%s[/b] — %s   дождь: %d%%" % [
 		str(rules.get("preset", "?")),
 		Difficulty.describe(Difficulty.current_preset()),
+		int(round(_rain.intensity() * 100.0)) if _rain != null else 0,
 	])
 	lines.append("WASD — движение, мышь — обзор, [b]Esc — пауза и настройки[/b]")
 	if not _last_message.is_empty():
