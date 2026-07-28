@@ -18,6 +18,10 @@ extends RefCounted
 ## их отдельно от каркаса здания (см. [method unload_furniture]).
 ##
 ## Фасад снаружи рисуется с `cull_back`, поэтому изнутри он не мешает.
+##
+## Свет. Внутри было почти ничего не видно, поэтому теперь: коридоры и
+## лестничная клетка светятся всегда, квартирные светильники горят почти
+## всегда, а настоящих источников шесть вместо трёх и с большим радиусом.
 
 const FLOOR_HEIGHT := 3.4
 const WALL_THICKNESS := 0.22
@@ -37,6 +41,10 @@ const MAX_BASEMENTS := 2
 const FURNITURE_VISIBLE_TO := 32.0
 ## Меньше этого пятна строить нечего: внутри не помещается даже коридор.
 const MIN_FOOTPRINT := 7.0
+## Настоящие источники света на один интерьер и их параметры.
+const MAX_INTERIOR_LIGHTS := 6
+const LIGHT_ENERGY := 2.8
+const LIGHT_RANGE := 10.0
 
 
 ## Собирает интерьер для локации атласа. Возвращает узел или null.
@@ -146,6 +154,16 @@ static func _assemble(interior_id: String, origin: Vector2, footprint: Vector2, 
 		_build_elevator(root, metal, walls, footprint, floors, basements)
 	_build_vents(metal, footprint, floors, basements, rng)
 
+	# Свет лестничной клетки на каждом уровне. Без него подъезд — чёрный
+	# колодец, и игрок вошёл в дом буквально вслепую.
+	var core_x: float = -footprint.x * 0.5 + WALL_THICKNESS + STAIR_RUN * 0.5
+	var core_z: float = -footprint.y * 0.5 + 1.2
+	for floor_index: int in range(-basements, floors):
+		lamps.append({
+			"position": Vector3(core_x, float(floor_index) * FLOOR_HEIGHT + FLOOR_HEIGHT - 0.5, core_z),
+			"lit": true,
+		})
+
 	_emit_multimesh(root, "Walls", walls, CityMaterials.interior_wall, 0.0)
 	_emit_multimesh(root, "Slabs", slabs, CityMaterials.interior_floor, 0.0)
 	_emit_multimesh(root, "Furniture", furniture, CityMaterials.furniture, FURNITURE_VISIBLE_TO)
@@ -163,6 +181,7 @@ static func _assemble(interior_id: String, origin: Vector2, footprint: Vector2, 
 	Log.info("InteriorFactory", "Интерьер построен", {
 		"здание": interior_id, "этажей": floors, "подвалов": basements,
 		"комнат": rooms.size(), "стен": walls.size(), "мебели": furniture.size(),
+		"светильников": lamps.size(),
 	})
 	return root
 
@@ -243,6 +262,13 @@ static func _build_perimeter(walls: Array[Transform3D], footprint: Vector2, y: f
 static func _build_floor_plan(walls: Array[Transform3D], furniture: Array[Transform3D], lamps: Array[Dictionary], rooms: Array[Dictionary], inner: Vector2, y: float, floor_index: int, location_id: String, rng: RandomNumberGenerator) -> void:
 	var h: float = FLOOR_HEIGHT - SLAB_THICKNESS
 	var cy: float = y + h * 0.5
+
+	# Свет в коридоре ставим всегда и до любых ранних выходов из функции:
+	# игрок заходит с улицы и должен видеть проход, а не чёрное пятно.
+	var corridor_lamps: int = clampi(int(inner.x / 4.0), 1, 6)
+	for i: int in range(corridor_lamps):
+		var lx: float = -inner.x * 0.5 + inner.x * (float(i) + 0.5) / float(corridor_lamps)
+		lamps.append({"position": Vector3(lx, y + FLOOR_HEIGHT - 0.4, 0.0), "lit": true})
 
 	var side_depth: float = (inner.y - CORRIDOR_WIDTH) * 0.5
 	if side_depth < MIN_ROOM:
@@ -332,7 +358,7 @@ static func _build_basement_plan(walls: Array[Transform3D], furniture: Array[Tra
 	var side_depth: float = (inner.y - corridor) * 0.5
 	if side_depth < 2.0:
 		# Совсем маленький подвал — один открытый объём с парой ящиков.
-		lamps.append({"position": Vector3(0.0, y + FLOOR_HEIGHT - 0.5, 0.0), "lit": rng.randf() < 0.35})
+		lamps.append({"position": Vector3(0.0, y + FLOOR_HEIGHT - 0.5, 0.0), "lit": rng.randf() < 0.8})
 		return
 
 	var cell_count: int = clampi(int(inner.x / rng.randf_range(3.0, 4.5)), 1, 8)
@@ -391,11 +417,18 @@ static func _build_basement_plan(walls: Array[Transform3D], furniture: Array[Tra
 				))
 				stack_y += crate.y
 
-		# Аварийный свет в подвале — редкий и часто погашенный.
+		# Аварийный свет в подвале. Раньше он горел в четырёх случаях из десяти,
+		# и подвал был просто чёрным экраном.
 		lamps.append({
 			"position": Vector3(float(side) * inner.x * 0.2, y + FLOOR_HEIGHT - 0.5, 0.0),
-			"lit": rng.randf() < 0.4,
+			"lit": rng.randf() < 0.85,
 		})
+
+	# Коридорные лампы подвала: по ним игрок видит, куда идёт.
+	var basement_lamps: int = clampi(int(inner.x / 5.0), 1, 5)
+	for i: int in range(basement_lamps):
+		var lx: float = -inner.x * 0.5 + inner.x * (float(i) + 0.5) / float(basement_lamps)
+		lamps.append({"position": Vector3(lx, y + FLOOR_HEIGHT - 0.45, 0.0), "lit": true})
 
 	# Котельная: два бака и трубы под потолком коридора.
 	metal.append(Transform3D(
@@ -413,10 +446,11 @@ static func _build_basement_plan(walls: Array[Transform3D], furniture: Array[Tra
 static func _furnish(furniture: Array[Transform3D], lamps: Array[Dictionary], room: Rect2, y: float, rng: RandomNumberGenerator) -> void:
 	var center: Vector2 = room.get_center()
 
-	# Потолочный светильник.
+	# Потолочный светильник. Погашенные квартиры остались для настроения,
+	# но их теперь меньшинство: в темноте комнату невозможно обыскать.
 	lamps.append({
 		"position": Vector3(center.x, y + FLOOR_HEIGHT - 0.45, center.y),
-		"lit": rng.randf() < 0.45,
+		"lit": rng.randf() < 0.9,
 	})
 
 	if room.size.x < 2.4 or room.size.y < 2.4:
@@ -635,8 +669,11 @@ static func _emit_multimesh(root: Node3D, node_name: String, transforms: Array[T
 	root.add_child(instance)
 
 
-## Светильники: эмиссивные панели для всех, настоящий свет — только паре штук,
+## Светильники: эмиссивные панели для всех, настоящий свет — шести штукам,
 ## иначе подъезд на 8 этажей заведёт сотню источников.
+##
+## Сами источники берутся НЕ по порядку, а с равномерным шагом по списку:
+## иначе всё шесть доставались подвалу и первому этажу, а выше стояла тьма.
 static func _emit_lamps(root: Node3D, lamps: Array[Dictionary]) -> void:
 	if lamps.is_empty():
 		return
@@ -649,7 +686,15 @@ static func _emit_lamps(root: Node3D, lamps: Array[Dictionary]) -> void:
 	mm.mesh = CityMaterials.box_mesh()
 	mm.instance_count = lamps.size()
 
+	# Сколько горящих светильников всего — отсюда шаг выборки.
+	var lit_total: int = 0
+	for lamp: Dictionary in lamps:
+		if bool(lamp.get("lit", false)):
+			lit_total += 1
+	var step: int = maxi(1, int(ceil(float(maxi(1, lit_total)) / float(MAX_INTERIOR_LIGHTS))))
+
 	var real_lights: int = 0
+	var lit_seen: int = 0
 	for i: int in range(lamps.size()):
 		var lamp: Dictionary = lamps[i]
 		var lit: bool = bool(lamp["lit"])
@@ -658,18 +703,26 @@ static func _emit_lamps(root: Node3D, lamps: Array[Dictionary]) -> void:
 			lamp["position"]
 		))
 		mm.set_instance_color(i, warm)
-		# Погашенный светильник — почти нулевая яркость и «битый» флаг.
-		mm.set_instance_custom_data(i, Color(float(i) * 0.031, 0.85 if lit else 0.04, 0.0 if lit else 1.0, 0.0))
+		# Погашенный светильник всё равно слабо тлеет: в полной темноте
+		# игрок не понимает, где потолок, а где проём.
+		mm.set_instance_custom_data(i, Color(float(i) * 0.031, 1.0 if lit else 0.12, 0.0 if lit else 1.0, 0.0))
 
-		if lit and real_lights < 3:
-			var light := OmniLight3D.new()
-			light.light_color = warm
-			light.light_energy = 1.1
-			light.omni_range = 6.5
-			light.shadow_enabled = false
-			light.position = (lamp["position"] as Vector3) - Vector3(0.0, 0.2, 0.0)
-			root.add_child(light)
-			real_lights += 1
+		if not lit:
+			continue
+		lit_seen += 1
+		if real_lights >= MAX_INTERIOR_LIGHTS or (lit_seen - 1) % step != 0:
+			continue
+
+		var light := OmniLight3D.new()
+		light.name = "InteriorLight_%d" % real_lights
+		light.light_color = warm
+		light.light_energy = LIGHT_ENERGY
+		light.omni_range = LIGHT_RANGE
+		light.omni_attenuation = 1.0
+		light.shadow_enabled = false
+		light.position = (lamp["position"] as Vector3) - Vector3(0.0, 0.2, 0.0)
+		root.add_child(light)
+		real_lights += 1
 
 	var instance := MultiMeshInstance3D.new()
 	instance.name = "CeilingLights"
