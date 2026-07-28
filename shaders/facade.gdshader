@@ -17,12 +17,13 @@ group_uniforms Facade;
 // Базовый цвет остаётся ориентиром яркости, но конкретный оттенок стены
 // выбирается по сиду здания из семейств ниже: город из одного цвета
 // выглядит как чёрные коробки.
-uniform vec3 wall_color : source_color = vec3(0.055, 0.062, 0.086);
-uniform vec3 window_dark : source_color = vec3(0.016, 0.020, 0.032);
-uniform vec3 window_warm : source_color = vec3(1.0, 0.77, 0.42);
+uniform vec3 wall_color : source_color = vec3(0.155, 0.166, 0.196);
+uniform vec3 window_dark : source_color = vec3(0.030, 0.036, 0.052);
+uniform vec3 window_warm : source_color = vec3(1.0, 0.79, 0.46);
 // Сила разброса материалов: 0 — все здания одного цвета,
-// 1 — полный набор семейств. Радуги не будет: палитра умышленно приглушённая.
-uniform float material_variety : hint_range(0.0, 1.0) = 0.85;
+// 1 — полный набор семейств. Радуги не будет: палитра умышленно земляная,
+// различаются только светлота и теплота оттенка.
+uniform float material_variety : hint_range(0.0, 1.0) = 1.0;
 uniform float floor_height = 3.4;
 uniform float window_pitch = 2.3;
 uniform float window_width = 1.3;
@@ -32,18 +33,20 @@ uniform float window_height = 1.5;
 uniform float emission_energy = 0.5;
 // Свечение крыши. С высоты видны именно крыши, а не фасады.
 uniform float roof_glow : hint_range(0.0, 1.0) = 0.1;
+// Насколько соседние дома одного семейства различаются по светлоте.
+uniform float shade_spread : hint_range(0.0, 1.0) = 0.75;
 
 group_uniforms Relief;
 // Псевдорельеф: вертикальные пилястры и подоконные ленты рисуются
 // в шейдере через нормаль и затенение: геометрию такие мелочи
 // не тратят, но плоская стена перестаёт быть плоской.
-uniform float pilaster_strength : hint_range(0.0, 1.0) = 0.55;
-uniform float band_strength : hint_range(0.0, 1.0) = 0.45;
+uniform float pilaster_strength : hint_range(0.0, 1.0) = 0.62;
+uniform float band_strength : hint_range(0.0, 1.0) = 0.5;
 uniform float recess_strength : hint_range(0.0, 1.0) = 0.7;
 
 group_uniforms Weather;
 uniform float wetness : hint_range(0.0, 1.0) = 0.55;
-uniform float grime : hint_range(0.0, 1.0) = 0.6;
+uniform float grime : hint_range(0.0, 1.0) = 0.5;
 
 varying vec3 v_local;
 varying vec3 v_size;
@@ -74,46 +77,52 @@ float hash12(vec2 p) {
 	return fract((p3.x + p3.y) * p3.z);
 }
 
-// Семейство отделки стены по сиду. Оттенки взяты из ночного нуара:
-// бетон, кирпич, песчаник, стеклянная башня, окисленная медь, тёмный сланец.
+// Семейство отделки стены по сиду. Оттенки нуарные, но светлее прежних
+// примерно втрое: при ночном освещении тёмные тона схлопывались в один
+// чёрный, и разница между кирпичом и бетоном была не видна.
+// Насыщенность остаётся низкой — это городские материалы, а не радуга.
 vec3 material_family(float seed01, out float rough_bias, out float metal_bias) {
-	float pick = fract(seed01 * 6.0);
-	int family = int(floor(seed01 * 6.0));
+	float pick = fract(seed01 * 7.0);
+	int family = int(floor(seed01 * 7.0));
 	vec3 base;
 	rough_bias = 0.0;
 	metal_bias = 0.0;
 
 	if (family == 0) {
-		// Серый бетон.
-		base = vec3(0.108, 0.114, 0.126);
+		// Светлый серый бетон.
+		base = vec3(0.330, 0.342, 0.362);
 		rough_bias = 0.08;
 	} else if (family == 1) {
 		// Красно-коричневый кирпич.
-		base = vec3(0.132, 0.079, 0.068);
+		base = vec3(0.352, 0.196, 0.158);
 		rough_bias = 0.12;
 	} else if (family == 2) {
-		// Песчаник / штукатурка.
-		base = vec3(0.150, 0.128, 0.098);
+		// Песчаник / тёплая штукатурка.
+		base = vec3(0.388, 0.330, 0.244);
 		rough_bias = 0.06;
 	} else if (family == 3) {
 		// Стеклянная башня: сине-стальной.
-		base = vec3(0.068, 0.086, 0.124);
+		base = vec3(0.196, 0.250, 0.344);
 		rough_bias = -0.22;
 		metal_bias = 0.25;
 	} else if (family == 4) {
 		// Окисленная медь / зелёный камень.
-		base = vec3(0.076, 0.112, 0.100);
+		base = vec3(0.204, 0.302, 0.268);
 		rough_bias = 0.02;
 		metal_bias = 0.12;
+	} else if (family == 5) {
+		// Грязно-бежевая старая застройка.
+		base = vec3(0.412, 0.386, 0.330);
+		rough_bias = 0.14;
 	} else {
-		// Тёмный сланец — базовый нуарный тон.
-		base = vec3(0.072, 0.076, 0.092);
+		// Тёмный сланец — базовый нуарный тон, он же самый тёмный.
+		base = vec3(0.212, 0.222, 0.262);
 		rough_bias = 0.05;
 	}
 
-	// Разброс яркости внутри семейства: два соседних бетонных дома
+	// Разброс светлоты внутри семейства: два соседних бетонных дома
 	// всё равно отличаются.
-	float shade = mix(0.72, 1.34, pick);
+	float shade = mix(1.0 - 0.42 * shade_spread, 1.0 + 0.5 * shade_spread, pick);
 	return base * shade;
 }
 
@@ -143,8 +152,8 @@ void fragment() {
 	float metal_bias = 0.0;
 	vec3 family = material_family(seed01, rough_bias, metal_bias);
 	vec3 wall = mix(wall_color, family, material_variety);
-	// Совсем чуть подмешиваем цвет района: дома квартала читаются как семья.
-	wall = mix(wall, wall * (0.7 + 0.6 * v_tint), 0.12 * material_variety);
+	// Чуть подмешиваем цвет района: дома квартала читаются как семья.
+	wall = mix(wall, wall * (0.7 + 0.6 * v_tint), 0.16 * material_variety);
 
 	vec3 albedo = wall;
 	vec3 emission = vec3(0.0);
@@ -155,7 +164,7 @@ void fragment() {
 	if (roof) {
 		// Крыша: тёмный рубероид, шум под вентиляцию и подсветка техплощадок.
 		float speck = hash12(floor(uv * 0.5) + seed);
-		albedo = wall * (0.42 + 0.28 * speck);
+		albedo = wall * (0.38 + 0.26 * speck);
 		rough = mix(0.92, 0.45, wetness * 0.6);
 		metallic = 0.05;
 		emission = mix(window_warm, v_tint, 0.65) * roof_glow
@@ -202,18 +211,22 @@ void fragment() {
 		float pil_phase = fract(grid.x / pil_period);
 		float pil = 1.0 - smoothstep(0.06, 0.13, abs(pil_phase - 0.5));
 		pil *= 1.0 - in_window;
-		albedo = mix(albedo, wall * 1.25, pilaster_strength * pil);
+		albedo = mix(albedo, wall * 1.3, pilaster_strength * pil);
 		normal_offset.x += (pil_phase - 0.5) * pilaster_strength * pil * 1.4;
 
 		// Подоконные ленты на границе этажей.
 		float band = 1.0 - smoothstep(0.02, 0.09, abs(fract(grid.y) - 0.02));
 		band *= 1.0 - in_window;
-		albedo = mix(albedo, wall * 1.35, band_strength * band);
+		albedo = mix(albedo, wall * 1.4, band_strength * band);
 		normal_offset.y -= band_strength * band * 0.9;
+
+		// Цоколь: нижние полтора метра — тёмный камень, как в реальной застройке.
+		float plinth = 1.0 - smoothstep(1.1, 1.6, uv.y);
+		albedo = mix(albedo, wall * 0.45, plinth * 0.8);
 
 		// Углы здания темнее: грязь и собственная тень.
 		float corner = smoothstep(0.42, 0.5, max(abs(v_local.x), abs(v_local.z)));
-		albedo *= 1.0 - 0.18 * corner;
+		albedo *= 1.0 - 0.16 * corner;
 
 		rough = mix(rough, 0.06, in_window);
 		metallic = mix(metallic, 0.35, in_window);
@@ -221,9 +234,9 @@ void fragment() {
 
 	// Вертикальные подтёки от дождя.
 	float streak = hash12(vec2(floor(uv.x * 2.5), seed * 0.37));
-	albedo *= 1.0 - grime * 0.4 * streak;
+	albedo *= 1.0 - grime * 0.32 * streak;
 	// Низ стены грязнее верха.
-	albedo *= mix(0.72, 1.0, clamp(height_m / 14.0, 0.0, 1.0));
+	albedo *= mix(0.8, 1.0, clamp(height_m / 14.0, 0.0, 1.0));
 
 	ALBEDO = albedo;
 	EMISSION = emission;
